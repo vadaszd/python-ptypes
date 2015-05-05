@@ -427,7 +427,7 @@ class Transaction(object):
                 except KeyError:
                     initPageVersion = page.resolveAccess(trx)
                 initPageVersion.candidateTrxs.add(trx)
-                newPageVersion = PageVersion(trx, page, initPageVersion)
+                newPageVersion = page.PageVersion(trx, page, initPageVersion)
                 return newPageVersion, initPageVersion
 
         @staticmethod
@@ -735,9 +735,13 @@ class PagePool(list):
     """ The universe of objects over which transactions operate.
     """
 
-    def __init__(self, numPages):
+    def __init__(self, initializers, Page, PageVersion):
+        self.Page = Page
+        self.PageVersion = PageVersion
+        self.pageCounter = count(0)
         for trx in Transaction.atomic():
-            list.__init__(self, (Page(trx, i) for i in range(numPages)))
+            list.__init__(self, (self.Page(self, trx, *args, **kwargs) 
+                                 for args, kwargs in initializers))
             for page in self:
                 pageVersion = page.latestVersion
                 pageVersion.readerTrxs.add(trx)
@@ -753,28 +757,23 @@ class Page(object):
     determined by the ``resolveAccess()`` method.
     """
 
-    def __init__(self, trx, pageOrdinal, ):
+    def __init__(self, pagePool, trx):
         """ 
         @param trx: the Transaction object creating the page
         @param pageOrdinal: an opaque reference to the entity this 
                 object represents
         """
-        self.ordinal = pageOrdinal
+        self.pagePool = pagePool
+        self.PageVersion = pagePool.PageVersion
+        self.ordinal = pagePool.pageCounter.next()
         self.versionCounter = count(0)
         # The most recent public version of the page.
-        self.latestVersion = PageVersion(trx, self, None)
+        self.latestVersion = self.PageVersion(trx, self, None)
 
     def __repr__(self):
         return "<{} #{} >".format(self.__class__.__name__,
                                   self.ordinal,)
 
-
-    def _selectPageVersion(self, trx):
-        pageVersion = self.latestVersion
-        while pageVersion.writerTrx.doesSucceed(trx):
-            pageVersion = pageVersion.prevPageVersion
-            assert pageVersion, "Should have found a suitable page version!"
-        return pageVersion
 
     def resolveAccess(self, trx):
         """ Resolve a 
@@ -782,7 +781,11 @@ class Page(object):
             is resolved to.
         @return: The page version to be used in the transaction.
         """
-        pageVersion = self._selectPageVersion(trx)
+        pageVersion = self.latestVersion
+        while pageVersion.writerTrx.doesSucceed(trx):
+            pageVersion = pageVersion.prevPageVersion
+            assert pageVersion, "Should have found a suitable page version!"
+
         pageVersion.readerTrxs.add(trx)
         # pageVersion.writerTrx does not succeed trx, so no cycle is formed here
         pageVersion.writerTrx._precedes(trx)
@@ -846,26 +849,3 @@ class PageVersion(object):
 
     def removed(self):
         print "Removed", self
-
-if __name__ == "__main__":
-
-    pp = PagePool(5)
-    p0 = pp[0]
-    t1 = Transaction()
-    t2 = Transaction()
-    print t1.readPage(p0)
-    print t2.readPage(p0)
-    print t1.updatePage(p0)
-    print t2.updatePage(p0)
-    t3 = Transaction()
-    print t3.readPage(pp[1])
-    print t1.end(), "t1"
-    print t3.updatePage(p0)
-    t4 = Transaction()
-    t5 = Transaction()
-    print t4.updatePage(pp[1])
-    print t2.end(), "t2"
-    print t4.end(), "t4"
-    print t5.updatePage(pp[1])
-    print t5.end(), "t5"
-    print t3.end(), "t3"
