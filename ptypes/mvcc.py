@@ -448,7 +448,19 @@ class Transaction(object):
         # can read & write, changes are isolated
         @staticmethod
         def fail(trx):
+            for page, pageVersion in trx.updateSet.items():
+                supersededVersion = pageVersion.prevPageVersion
+                if supersededVersion is None:
+                    continue
+                supersededVersion.candidateTrxs.remove(trx)
             trx.transit2(trx.Failed)
+
+        @staticmethod
+        def updatePage(trx, page):
+            newPageVersion, initPageVersion = \
+                                        trx.Private.updatePage(trx, page)
+            initPageVersion.candidateTrxs.add(trx)
+            return newPageVersion, initPageVersion
 
         @staticmethod
         def end(trx):
@@ -515,7 +527,8 @@ class Transaction(object):
                 supersededVersion.supersederTrx = trx
                 supersededVersion.readerTrxs.remove(trx)
                 supersededVersion.candidateTrxs.remove(trx)
-                for candidateTrx in supersededVersion.candidateTrxs:
+                for candidateTrx in supersededVersion.candidateTrxs.copy():
+#                     print "failing candidate", candidateTrx
                     candidateTrx.fail()
                 supersededVersion.candidateTrxs.clear()
                 for readerTrx in supersededVersion.readerTrxs:
@@ -601,12 +614,18 @@ class Transaction(object):
     class Aborted(Status): 
 
         @staticmethod
+        def fail(trx):
+            """ 
+            """
+
+        @staticmethod
         def _cascadeAbort(trx, updatedPages):
             "Diamond-shapes in the precedence graph may cause double-aborts;"
             "the 2nd must be ignored."
 
         @staticmethod
         def enter(trx): 
+#             print "aborting", trx
             for page, pageVersion in trx.updateSet.items():
                 prevPageVersion = pageVersion.prevPageVersion
                 if prevPageVersion.supersederTrx is trx:
@@ -649,7 +668,7 @@ class Transaction(object):
         self.updateSet = dict()  # superseding PageVersions, by page
         self.prevTrxs = set()    # transactions preceding this one
         self.nextTrxs = set()    # transactions this one precedes
-        self.transit2(self.Running)
+        self.status = self.Running
 
     def __repr__(self):
         return "<{} #{} in status {}>".format(self.__class__.__name__,
@@ -657,6 +676,7 @@ class Transaction(object):
                                               self.status.__name__)
 
     def transit2(self, newStatus):
+#         print self, "==>", newStatus.__name__
         self.status = newStatus
         self.status.enter(self)
 
@@ -849,3 +869,9 @@ class PageVersion(object):
 
     def removed(self):
         print "Removed", self
+
+
+""" Keeping precedence edges of aborted/failed trx is safe,
+but if contention is high, the graph will explode ...
+So revise if they can be removed!
+""" 

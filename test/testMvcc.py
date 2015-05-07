@@ -12,14 +12,14 @@ from mvcc import PagePool, Page, PageVersion, Transaction
 
 class MyPage(Page):
  
-    def update(self, trx, key, results):
+    def update(self, key, view, trx, ):
         new, old = trx.updatePage(self)
         new.data = old.data.copy()
         new.data[key] += 1
-        results.append(new.data[key])
+        view[self.ordinal] = new.data
 
-    def read(self, trx, key, results):
-        results.append(trx.readPage(self).data[key])
+    def read(self, key, view, trx, ):
+        view[self.ordinal] = trx.readPage(self).data
 
 class MyPageVersion(PageVersion):
 
@@ -30,36 +30,50 @@ class MyPageVersion(PageVersion):
 
 class Action(object):
 
-    def createPlan(self, pagePool, trx, op):
-        results = list()
-        pages = frozenset(random.sample(pagePool, random.randint(0,5)))
-        operations = list(partial(op, page, trx, pages, results) for page in pages)
-        return operations, results, pages
+    def createPlan(self, pagePool, op, view):
+        pages = random.sample(pagePool, random.randint(0, self.maxNumPagesInTrx))
+        key = frozenset(page.ordinal for page in pages)
+        operations = list(partial(op, page, key, view) 
+                          for page in pages)
+        return operations, key
 
-    def __init__(self, pagePool):
-        trx = Transaction()
-        updates, self.updateResults, self.updatePages = \
-            self.createPlan(pagePool, trx, MyPage.update)
-        reads, self.readResults, self.readPages = \
-            self.createPlan(pagePool, trx, MyPage.read)
+    def __init__(self, pagePool, maxNumPagesInTrx):
+        self.maxNumPagesInTrx = maxNumPagesInTrx
+        self.view = dict()  # {ordinal: data}
+        updates, self.updatedKey = \
+            self.createPlan(pagePool, MyPage.update, self.view)
+        reads, self.readKey = \
+            self.createPlan(pagePool, MyPage.read, self.view)
         self.operations = updates + reads
         random.shuffle(self.operations)
 
-    def assertSameResults(self, pages, results):
-        if results:
-            result1 = results[0]
-            assert all(result == result1 for result in results), [pages, results]
+    def assertSameResults(self, key):
+        datas = [self.view[ordinal] for ordinal in key]
+        try:
+            value1 = datas[0][key]
+        except IndexError: pass
+#             print self.trx.trxNumber, key
+        else:
+#             print self.trx.trxNumber, key, [data[key] for data in datas]
+            assert all(value1 == data[key] for data in datas), \
+                    [key, datas]
 
     def run(self):
+        trx = Transaction()
         for operation in self.operations:
-            operation()
+            operation(trx=trx)
+            page, key, view = operation.args
+#             print (self.trx.trxNumber, operation.func.__name__, 
+#                    page.ordinal, key)
             yield 
-        self.assertSameResults(self.readPages, self.readResults)
-        self.assertSameResults(self.updatePages, self.updateResults)
+        self.assertSameResults(self.readKey)
+        self.assertSameResults(self.updatedKey)
+        trx.end()
 
 class Test(unittest.TestCase):
 
     def testMvcc(self):
+        return
         pp = PagePool((((), {}) for _ in range(5)), Page, PageVersion)
         p0 = pp[0]
         t1 = Transaction()
@@ -82,12 +96,12 @@ class Test(unittest.TestCase):
         print t3.end(), "t3"
 
     def testMvccRandomly(self):
-        pagePool = PagePool((((), {}) for _ in range(5)), MyPage, 
+        pagePool = PagePool((((), {}) for _ in range(500)), MyPage, 
                             MyPageVersion)
         random.seed(13)
         generators = set()
-        for _ in range(120):
-            generators.add(Action(pagePool).run())
+        for _ in range(300):
+            generators.add(Action(pagePool, 3).run())
         while generators:
             generator = random.choice(list(generators))
             try:
