@@ -4,7 +4,9 @@
 from cpython.version cimport PY_MAJOR_VERSION
 from libc.string cimport memcpy, memcmp, memset
 from md5 cimport MD5_checksum, MD5_CTX, MD5_Init, MD5_Update, MD5_Final
-
+from pagemanager cimport pagesize, initPageManager,\
+                         CProtectedRegion_new,\
+                         CProtectedRegion_setCurrent
 
 from math import pow, log as logarithm
 from os import SEEK_SET, O_CREAT, O_RDWR
@@ -1377,7 +1379,6 @@ cdef char *ptypesMagic     = "ptypes-0.6.0"       # Maintained by bumpbersion,
 cdef char *ptypesRedoMagic = "redo-ptypes-0.6.0"  # no manual changes please!
 DEF lengthOfMagic = 31
 DEF numMetadata = 2
-DEF PAGESIZE = 4096
 
 cdef extern from "sys/mman.h":
     void *mmap(void *addr, size_t length, int prot, int flags, int fd,
@@ -1409,7 +1410,7 @@ cdef class MemoryMappedFile(object):
                                   )
             self.isNew = 1
             self.numPages = numPages
-            self.realFileSize = self.numPages * PAGESIZE
+            self.realFileSize = self.numPages * pagesize
             self.fd = os.open(self.fileName, O_CREAT | O_RDWR)
             os.lseek(self.fd, self.realFileSize-1, SEEK_SET)
             os.write(self.fd, b'\x00')
@@ -1418,7 +1419,7 @@ cdef class MemoryMappedFile(object):
                 "Opened existing file '{self.fileName}'".format(self=self))
             self.isNew = 0
             self.realFileSize = os.fstat(self.fd).st_size
-            self.numPages = int(self.realFileSize / PAGESIZE)
+            self.numPages = int(self.realFileSize / pagesize)
         cdef int myerr=0
         self.baseAddress = mmap(NULL, self.realFileSize, PROT_READ |PROT_WRITE,
                                 MAP_SHARED, self.fd, 0)
@@ -1620,7 +1621,7 @@ cdef class Storage(MemoryMappedFile):
 
             self.p2FileHeader.status = 'C'
             self.p2FileHeader.revision = i
-            self.p2FileHeader.freeOffset = numMetadata*PAGESIZE
+            self.p2FileHeader.freeOffset = numMetadata*pagesize
 
         self.p2FileHeader.status = 'D'
         self.p2LoHeader = self.p2FileHeaders[0]
@@ -1637,7 +1638,7 @@ cdef class Storage(MemoryMappedFile):
                    for j in range(len(ptypesMagic))
                    ):
                 raise Exception('File {self.fileName} is incompatible with '
-                                'this version of the graph DB!'.format(
+                                'this version of ptypes!'.format(
                                     self=self)
                                 )
             if (self.p2LoHeader == NULL or
@@ -1668,9 +1669,12 @@ cdef class Storage(MemoryMappedFile):
                  unsigned long stringRegistrySize=0
                  ):
         cdef unsigned long numPages = (
-            0 if fileSize==0 else (fileSize-1)/PAGESIZE + 1 + numMetadata
+            0 if fileSize==0 else (fileSize-1)/pagesize + 1 + numMetadata
         )
         MemoryMappedFile.__init__(self, fileName, numPages)
+        self.region = CProtectedRegion_new(self.baseAddress, self.realFileSize)
+        CProtectedRegion_setCurrent(self.region)
+
         LOG.debug("Highest metadata revision is {0}"
                   .format(self.p2HiHeader.revision))
         LOG.debug("Lowest metadata revision is {0}"
@@ -1885,3 +1889,5 @@ cdef class Storage(MemoryMappedFile):
 
     def populateSchema(self):
         pass
+
+initPageManager()

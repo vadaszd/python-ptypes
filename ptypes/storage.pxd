@@ -1,4 +1,5 @@
 from libc.stdlib cimport abort
+from pagemanager cimport CProtectedRegion
 
 ctypedef unsigned long Offset
 
@@ -268,6 +269,7 @@ cdef class Storage(MemoryMappedFile):
         CDbFileHeader       *p2HiHeader
         CDbFileHeader       *p2LoHeader
         CDbFileHeader       *p2FileHeader
+        CProtectedRegion    *region
 
         long                    stringRegistrySize
         readonly bint           createTypes

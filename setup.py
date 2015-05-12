@@ -20,6 +20,7 @@ moduleNamesAndExtraSources = [
           ("query",         []),
           ("buffer",        []),
           ("pcollections",  []),
+          ("pagemanager",  []),
           ]
 
 moduleNameAndSources = []
