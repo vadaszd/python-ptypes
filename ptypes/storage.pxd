@@ -1,5 +1,4 @@
 from libc.stdlib cimport abort
-from pagemanager cimport CProtectedRegion
 
 ctypedef unsigned long Offset
 
@@ -262,43 +261,12 @@ cdef class PField(object):
         object      set(PField self, PStructure owner, value)
         Persistent  get(PField self, PStructure owner)
 
-cdef class MemoryMappedFile(object):
-    cdef:
-        void            *baseAddress
-        void            *endAddress
-        long            fd
-        int             isNew
-        readonly str    fileName
-        readonly unsigned long long    numPages, realFileSize
-
-    cpdef flush(self, bint async=?)
-    cpdef close(self)
-
-    cdef inline assertNotClosed(self):
-        if self.baseAddress == NULL:
-            raise ValueError(
-                'Storage {self.fileName} is closed.'.format(self=self))
-
-
-DEF lengthOfMagic = 15
-DEF numMetadata = 2
-DEF PAGESIZE = 4096
-
-cdef struct CDbFileHeader:
-    char magic[lengthOfMagic]
-    char status
-    unsigned long revision
-    unsigned long lastAppliedRedoFileNumber
-    Offset o2lastAppliedTrx
+cdef struct CStorageHeader:
     Offset freeOffset, o2ByteStringRegistry, o2PickledTypeList, o2Root
 
-cdef class Storage(MemoryMappedFile):
+cdef class Storage(object):
     cdef:
-        CDbFileHeader       *p2FileHeaders[numMetadata]
-        CDbFileHeader       *p2HiHeader
-        CDbFileHeader       *p2LoHeader
-        CDbFileHeader       *p2FileHeader
-        CProtectedRegion    *region
+        CStorageHeader       *p2FileHeader
 
         long                    stringRegistrySize
         readonly bint           createTypes

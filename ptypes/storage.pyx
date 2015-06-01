@@ -1353,227 +1353,8 @@ cdef class PField(object):
 
 # ================ Storage ================
 
-cdef char *ptypesMagic     = "ptypes-0.6.0"       # Maintained by bumpbersion,
-cdef char *ptypesRedoMagic = "redo-ptypes-0.6.0"  # no manual changes please!
-DEF lengthOfMagic = 31
-DEF numMetadata = 2
 
-cdef extern from "sys/mman.h":
-    void *mmap(void *addr, size_t length, int prot, int flags, int fd,
-               int offset)
-    int munmap(void *addr, size_t length)
-    int PROT_READ, PROT_WRITE,
-    int MAP_SHARED, MAP_PRIVATE  # flags
-    void *MAP_FAILED
-
-    int msync(void *addr, size_t length, int flags)
-    int MS_ASYNC, MS_SYNC  # flags
-
-cdef extern from "errno.h":
-    int errno
-
-cdef extern from "string.h":
-    char *strerror(int errnum)
-
-cdef class MemoryMappedFile(object):
-
-    def __init__(self, str fileName, int numPages=0):
-        self.fileName = fileName
-        try:
-            self.fd = os.open(self.fileName, os.O_RDWR)
-        except OSError:
-            LOG.debug("Creating new file '{self.fileName}'".format(self=self))
-            assert numPages > 0, ('The database cannot have {numPages} pages.'
-                                  .format(numPages=self.numPages)
-                                  )
-            self.isNew = 1
-            self.numPages = numPages
-            self.realFileSize = self.numPages * pagesize
-            self.fd = os.open(self.fileName, O_CREAT | O_RDWR)
-            os.lseek(self.fd, self.realFileSize-1, SEEK_SET)
-            os.write(self.fd, b'\x00')
-        else:
-            LOG.debug(
-                "Opened existing file '{self.fileName}'".format(self=self))
-            self.isNew = 0
-            self.realFileSize = os.fstat(self.fd).st_size
-            self.numPages = int(self.realFileSize / pagesize)
-        cdef int myerr=0
-        self.baseAddress = mmap(NULL, self.realFileSize, PROT_READ |PROT_WRITE,
-                                MAP_SHARED, self.fd, 0)
-        if self.baseAddress == MAP_FAILED:
-            myerr = errno  # save it, any c-lib call may overwrite it!
-            raise Exception('Could not map {self.fileName}: {0}'
-                            .format(strerror(myerr), self=self)
-                            )
-        self.endAddress = self.baseAddress + self.realFileSize
-        LOG.debug('Mmapped {self.fileName} memory region {0}-{1}'
-                  .format(hex(<unsigned long>self.baseAddress),
-                          hex(self.realFileSize), self=self)
-                  )
-        if self.isNew:
-            self._initialize()
-        else:
-            self._mount()
-
-    cpdef flush(self, bint async=0):
-        cdef int myerr=0
-        LOG.debug('Msyncing {self.fileName} memory region {0}-{1}'
-                  .format(hex(<unsigned long>self.baseAddress),
-                          hex(self.realFileSize), self=self)
-                  )
-        if msync(self.baseAddress, self.realFileSize,
-                 MS_ASYNC if async else MS_SYNC):
-            myerr = errno  # save it, any c-lib call may overwrite it!
-            raise Exception('Could not sync {self.fileName}: {0}'
-                            .format(strerror(myerr), self=self)
-                            )
-
-    cpdef close(self):
-        self.assertNotClosed()
-        cdef int myerr=0
-        LOG.debug('Unmapping {self.fileName} memory region {0}-{1}'
-                  .format(hex(<unsigned long>self.baseAddress),
-                          hex(self.realFileSize), self=self)
-                  )
-        if munmap(self.baseAddress, self.realFileSize):
-            myerr = errno
-            raise Exception('Could not unmap {self.fileName}: {0}'
-                            .format(strerror(myerr), self=self)
-                            )
-        os.close(self.fd)
-        self.baseAddress = NULL
-
-    def __repr__(self):
-        return ("<{self.__class__.__name__} '{self.fileName}'>"
-                .format(self=self))
-
-
-cdef struct CRedoFileHeader:
-    char magic[lengthOfMagic]
-
-    # offsets to the first trx header and to where the next trx header
-    # probably can be written (just a hint, a shortcut to a trx header
-    # near to the tail, need to verify if it is really unused,
-    # i.e. the length & checksum of the trx header are zeros)
-    Offset o2firstTrx, o2Tail
-
-cdef class Redo(MemoryMappedFile):
-    cdef:
-        CRedoFileHeader       *p2FileHeader
-        CTrxHeader            *p2Tail
-
-    def __init__(self, str fileName, int numPages=0):
-        MemoryMappedFile.__init__(self, fileName, numPages)
-        cdef:
-            MD5_CTX md5Context
-            MD5_checksum checksum
-        self.p2Tail = <CTrxHeader*>(self.baseAddress +
-                                    self.p2FileHeader.o2Tail)
-        while (self.p2Tail.length != 0 and
-               self.p2Tail.length < self.realFileSize
-               ):
-            MD5_Init(&md5Context)
-            MD5_Update(&md5Context, <void*>(self.p2Tail+1), self.p2Tail.length)
-            MD5_Final(checksum, &md5Context, )
-            if memcmp(self.p2Tail.checksum, checksum, sizeof(MD5_checksum)):
-                break
-            self.p2Tail = <CTrxHeader *>(<void*>self.p2Tail +
-                                         sizeof(CTrxHeader) +
-                                         self.p2Tail.length
-                                         )
-
-    def _initialize(self):
-        LOG.info("Initializing journal '{self.fileName}'".format(self=self))
-        assert len(ptypesRedoMagic) < lengthOfMagic
-        cdef int j
-        self.p2FileHeader = <CRedoFileHeader*>self.baseAddress
-        for j in range(len(ptypesRedoMagic)):
-            self.p2FileHeader.magic[j] = ptypesRedoMagic[j]
-        self.p2FileHeader.o2Tail = self.p2FileHeader.o2firstTrx = sizeof(
-            CRedoFileHeader)  # numMetadata*PAGESIZE
-
-    def _mount(self):
-        LOG.info(
-            "Mounting existing journal '{self.fileName}'".format(self=self))
-        self.p2FileHeader = <CRedoFileHeader*>self.baseAddress
-        if any(self.p2FileHeader.magic[j] != ptypesRedoMagic[j]
-               for j in range(len(ptypesRedoMagic))
-               ):
-            raise Exception('File {self.fileName} is incompatible with this'
-                            'version of ptypes!'.format(self=self)
-                            )
-
-    cpdef close(self):
-        self.flush()
-        self.p2FileHeader.o2Tail = <void*>self.p2Tail - self.baseAddress
-        self.flush()
-
-cdef struct CTrxHeader:
-    # A transaction starts with a trx header, which is followed by a set of
-    # redo records with the given total length.
-    # It is committed if the checksum is correct (it is filled in after all the
-    # redo records).
-    # We rely on the "sparse file" mechanism of the kernel to initialize this
-    # data structure to zeros.
-    unsigned long length
-    MD5_checksum checksum
-
-cdef struct CRedoRecordHeader:
-    # A redo record consists of a redo record header followed by a body
-    # The body has the given length and is opaque; it is copied byte-by-byte
-    # to the target offset when the redo is applied.
-    Offset offset
-    unsigned long length
-
-cdef class Trx(object):
-    cdef:
-        Storage          storage
-        Redo                redo
-#         CRedoFileHeader     *p2FileHeader
-#         CTrxHeader          *p2TrxHeader
-        CRedoRecordHeader   *p2CRedoRecordHeader
-        MD5_CTX             md5Context
-
-    def __init__(self, Storage storage, Redo redo):
-        self.storage = storage
-        self.redo = redo
-        redo.assertNotClosed()
-#         self.p2FileHeader = redo.p2FileHeader
-
-        self.p2CRedoRecordHeader = (<CRedoRecordHeader*>
-                                    (<void*>redo.p2Tail +
-                                     sizeof(CRedoRecordHeader)
-                                     )
-                                    )
-        MD5_Init(&self.md5Context)
-
-    cdef save(self, const void *sourceAddress, unsigned long length):
-        assert self.redo
-        assert self.storage
-        if (<void*>self.p2CRedoRecordHeader +
-                sizeof(CRedoRecordHeader) +length >= self.redo.endAddress):
-            raise RedoFullException("{0} is full.".format(self.redo.fileName))
-        self.p2CRedoRecordHeader.offset = sourceAddress - \
-            self.storage.baseAddress
-        self.p2CRedoRecordHeader.length = length
-#         cdef Offset newRedoOffset
-        cdef void *redoRecordPayload = <void*>(self.p2CRedoRecordHeader+1)
-        memcpy(redoRecordPayload, sourceAddress, length)
-        MD5_Update(&self.md5Context, <void*>(self.p2CRedoRecordHeader),
-                   sizeof(CRedoRecordHeader) + length)
-        self.p2CRedoRecordHeader = <CRedoRecordHeader*>(redoRecordPayload +
-                                                        length)
-
-    cdef commit(self, lazy=False):
-        MD5_Final((self.redo.p2Tail.checksum), &self.md5Context, )
-        self.redo.p2Tail.length = (<void*>self.p2CRedoRecordHeader -
-                                   <void*>self.redo.p2Tail)
-        self.redo.p2Tail = <CTrxHeader*>self.p2CRedoRecordHeader
-        self.redo.flush(lazy)
-        self.redo = self.storage = None
-
-cdef class Storage(MemoryMappedFile):
+cdef class Storage(object):
 
     cdef registerType(self, PersistentMeta ptype):
         if hasattr(self.schema, ptype.__name__):
@@ -1588,7 +1369,7 @@ cdef class Storage(MemoryMappedFile):
         cdef int i, j
         for i in range(numMetadata):
             self.p2FileHeader = self.p2FileHeaders[i] = \
-                <CDbFileHeader*>self.baseAddress + i
+                <CStorageHeader*>self.baseAddress + i
 
             for j in range(len(ptypesMagic)):
                 self.p2FileHeader.magic[j] = ptypesMagic[j]
@@ -1607,7 +1388,7 @@ cdef class Storage(MemoryMappedFile):
         cdef int i
         for i in range(numMetadata):
             self.p2FileHeader = self.p2FileHeaders[i] = \
-                <CDbFileHeader*>self.baseAddress + i
+                <CStorageHeader*>self.baseAddress + i
             if any(self.p2FileHeader.magic[j] != ptypesMagic[j]
                    for j in range(len(ptypesMagic))
                    ):
@@ -1747,7 +1528,7 @@ cdef class Storage(MemoryMappedFile):
     cpdef flush(self, bint async=False):
         LOG.debug("Flushing {}".format(self))
         self.__flush()
-        cdef CDbFileHeader *p2FileHeader = self.p2FileHeader
+        cdef CStorageHeader *p2FileHeader = self.p2FileHeader
         cdef unsigned long revision = p2FileHeader.revision + 1
         self.p2FileHeader = self.p2FileHeaders[revision % numMetadata]
         self.p2FileHeader[0] = p2FileHeader[0]
@@ -1864,4 +1645,3 @@ cdef class Storage(MemoryMappedFile):
     def populateSchema(self):
         pass
 
-initPageManager()

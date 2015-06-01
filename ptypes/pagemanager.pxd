@@ -3,12 +3,24 @@
 cdef initPageManager()
 cdef int pagesize
 
-cdef struct CProtectedRegion:
-    void *baseAddress
-    size_t length
-    void *endAddress
 
-cdef CProtectedRegion *CProtectedRegion_new(void *baseAddress,
-                                            size_t length,) except NULL
-cdef CProtectedRegion *CProtectedRegion_setCurrent(CProtectedRegion *region)
-# cdef int CProtectedRegion_protect(CProtectedRegion *region)
+cdef class MemoryMappedFile(object):
+    cdef:
+        readonly str    fileName
+        long            fd
+        int             isNew
+        readonly unsigned long long    numPages, realFileSize
+
+    cpdef flush(self, bint async=?)
+    cpdef close(self)
+
+    cdef inline assertNotClosed(self):
+        if self.baseAddress == NULL:
+            raise ValueError(
+                'MemoryMappedFile {self.fileName} is closed.'
+                .format(self=self))
+
+
+DEF lengthOfMagic = 31
+DEF numMetadata = 2
+
