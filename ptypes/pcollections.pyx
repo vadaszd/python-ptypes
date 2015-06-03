@@ -15,21 +15,16 @@ cdef struct CSkipNode:
     Offset o2Next  # array of pointers to CSkipNode objects
     unsigned int  numberOfLevels
 
-cdef inline CSkipNode* getNextAtLevel(Storage storage, CSkipNode *p2CSkipNode,
+cdef inline CSkipNode* getNextAtLevel(PSkipList self, CSkipNode *p2CSkipNode,
                                       int level) except NULL:
-    cdef CSkipNode *x = (
-        <CSkipNode* >(storage.baseAddress +
-                      (<unsigned long*>(storage.baseAddress +
-                                        p2CSkipNode.o2Next)
-                       )[level]
-                      )
-    )
+    cdef CSkipNode *x = (<CSkipNode* > (self.offset2Address(
+        (<unsigned long*>(self.offset2Address(p2CSkipNode.o2Next)))[level])))
     # print 'getNextAtLevel', hex(<unsigned long><void*>x)
     return x
-cdef inline setNextAtLevel(Storage storage, CSkipNode *p2CSkipNode, int level,
+cdef inline setNextAtLevel(PSkipList self, CSkipNode *p2CSkipNode, int level,
                            CSkipNode* p2):
-    (<unsigned long *>(storage.baseAddress+p2CSkipNode.o2Next))[level] = \
-        <void*>p2 - storage.baseAddress
+    (<unsigned long *>(self.offset2Address(p2CSkipNode.o2Next)))[level] = \
+        self.address2Offset(p2)
 
 
 cdef class SkipNodeMeta(PersistentMeta):
@@ -90,8 +85,7 @@ cdef class PSkipNode(AssignedByReference):
         self.getP2IS().numberOfLevels = level
 
         # Array of offsets to CSkipNodes
-        self.getP2IS().o2Next = \
-            self.ptype.storage.allocate(level*sizeof(Offset))
+        self.getP2IS().o2Next = self.allocate(level*sizeof(Offset))
 
         # Theoretically we would need to initialize the allocated array here.
         # In practice it will be initialized when it is inserted into the list.
@@ -129,9 +123,9 @@ cdef class PSkipNode(AssignedByReference):
             return key.richcmp(other, op)
 
 
-cdef CSkipNode2str(CSkipNode *node, Storage storage):
+cdef CSkipNode2str(PSkipList self, CSkipNode *node):
     return "[@offset={0} key={1} o2Value={2} o2Next={3} #lvls={4}]"\
-        .format(hex(<void*>node-storage.baseAddress),
+        .format(hex(self.address2Offset(node)),
                 'node.key', 'hex(node.o2Value)', hex(node.o2Next),
                 node.numberOfLevels)  # XXX print key properly
 
@@ -216,14 +210,13 @@ cdef class PSkipList(AssignedByReference):
         for level in range(head.numberOfLevels-1, -1, -1):
             print 'level %d:' % level,
             node = self.getHead()
-            while node != self.ptype.storage.baseAddress:
-                print "{0} =>".format(CSkipNode2str(node, self.ptype.storage)),
-                node = getNextAtLevel(self.ptype.storage, node, level)
+            while not self.isNullAddress(node):
+                print "{0} =>".format(CSkipNode2str(self, node)),
+                node = getNextAtLevel(self, node, level)
             print 'END'
 
     cdef inline CSkipNode *getHead(PSkipList self):
-        return <CSkipNode *>(self.ptype.storage.baseAddress +
-                             self.getP2IS().o2Head)
+        return <CSkipNode *>(self.offset2Address(self.getP2IS().o2Head))
 
     def __iter__(PSkipList self):
         return self.range(None, None)
@@ -240,19 +233,19 @@ cdef class PSkipList(AssignedByReference):
             PSkipNode skipNode
         if head.numberOfLevels > 0:
             if fro is None:
-                cSkipNode = getNextAtLevel(self.ptype.storage, head, 0)
+                cSkipNode = getNextAtLevel(self, head, 0)
             else:
                 cutList= self.getCutList(fro)
-                cSkipNode = getNextAtLevel(self.ptype.storage, cutList[0], 0)
+                cSkipNode = getNextAtLevel(self, cutList[0], 0)
                 free(cutList)
             while True:
-                if <void*>cSkipNode == self.ptype.storage.baseAddress:
+                if self.isNullAddress(cSkipNode):
                     break
                 skipNode = entryClass.createProxyFA(cSkipNode)
                 if to is not None and skipNode >= to:
                     break
                 yield skipNode.getValue()
-                cSkipNode = getNextAtLevel(self.ptype.storage, cSkipNode, 0)
+                cSkipNode = getNextAtLevel(self, cSkipNode, 0)
 
     cdef CSkipNode ** getCutList(PSkipList self, object value) except NULL:
         """ Find (at each level) the pointer to the Node after the insert.
@@ -271,9 +264,9 @@ cdef class PSkipList(AssignedByReference):
         try:
             while level >= 0:
                 while True:
-                    nextNodeAtLevel = getNextAtLevel(self.ptype.storage,
+                    nextNodeAtLevel = getNextAtLevel(self,
                                                      nodeAtLevel, level)
-                    if nextNodeAtLevel == self.ptype.storage.baseAddress:
+                    if self.isNullAddress(nextNodeAtLevel):
                         break
                     skipNode = entryClass.createProxyFA(nextNodeAtLevel)
                     if skipNode >= value:
@@ -297,9 +290,9 @@ cdef class PSkipList(AssignedByReference):
 
         if head.numberOfLevels > 0:
             cutList= self.getCutList(key)
-            cSkipNode = getNextAtLevel(self.ptype.storage, cutList[0], 0)
+            cSkipNode = getNextAtLevel(self, cutList[0], 0)
             free(cutList)
-            if cSkipNode != self.ptype.storage.baseAddress:
+            if not self.isNullAddress(cSkipNode):
                 skipNode = entryClass.createProxyFA(cSkipNode)
                 if skipNode == key:
                     return cSkipNode
@@ -321,9 +314,9 @@ cdef class PSkipList(AssignedByReference):
 
         level = self.randomLevel()
         if head.numberOfLevels < level:
-            next = <Offset *>(self.ptype.storage.baseAddress + head.o2Next)
-            head.o2Next = self.ptype.storage.allocate(sizeof(Offset)*level)
-            newNext = <Offset *>(self.ptype.storage.baseAddress + head.o2Next)
+            next = <Offset *>(self.offset2Address(head.o2Next))
+            head.o2Next = self.allocate(sizeof(Offset)*level)
+            newNext = <Offset *>(self.offset2Address(head.o2Next))
             for i in range(head.numberOfLevels):
                 newNext[i] = next[i]
             for i in range(head.numberOfLevels, level):
@@ -334,9 +327,9 @@ cdef class PSkipList(AssignedByReference):
             PSkipNode node = entryClass(value, level)
             CSkipNode **cutList = self.getCutList(node.getKey())
         for i in range(level):
-            setNextAtLevel(self.ptype.storage, node.getP2IS(), i,
-                           getNextAtLevel(self.ptype.storage, cutList[i], i))
-            setNextAtLevel(self.ptype.storage, cutList[i], i, node.getP2IS())
+            setNextAtLevel(self, node.getP2IS(), i,
+                           getNextAtLevel(self, cutList[i], i))
+            setNextAtLevel(self, cutList[i], i, node.getP2IS())
         free(cutList)
         self.getP2IS().actualSize+=1
 

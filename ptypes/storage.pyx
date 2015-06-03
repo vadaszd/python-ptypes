@@ -121,14 +121,13 @@ cdef class AssignedByValue(Persistent):
 # ================ Assignment By Reference ================
 
 cdef Offset resolveReference(PersistentMeta ptype, Offset offset) except -1:
-    return (<Offset*>(ptype.storage.baseAddress + offset))[0]
+    return (<Offset*>ptype.offset2Address(offset))[0]
 
 cdef class AssignedByReference(Persistent):
     # p2InternalStructure points at a stand-alone object on the heap
     cdef store(AssignedByReference self, void *target):
         # store the offset to the value
-        (<Offset*>target)[0] = (self.p2InternalStructure -
-                                self.storage.baseAddress)
+        (<Offset*>target)[0] = self.address2Offset(self.p2InternalStructure)
 
     # works only with persistent values. Can be specialized in derived
     # classes for specific types.
@@ -231,11 +230,6 @@ cdef class PersistentMeta(type):
     cdef Persistent createProxy(PersistentMeta ptype, Offset offset):
         cdef Persistent self
         if offset:
-            if ptype.storage.realFileSize < offset:
-                print(
-                    "Corruption: offset {offset} is outside the mapped memory!"
-                    " - Aborting.".format(offset=offset))
-                abort()
             self = ptype.__new__(ptype)
             self.p2InternalStructure =  ptype.offset2Address(offset)
             self.ptype = ptype
@@ -274,7 +268,7 @@ cdef class PersistentMeta(type):
             (<Persistent>ptype(source)).store(target)
 
     cdef void clear(PersistentMeta ptype, Offset o2Target):
-        memset(ptype.storage.baseAddress + o2Target, 0, ptype.assignmentSize)
+        memset(ptype.offset2Address(o2Target), 0, ptype.assignmentSize)
 
     cdef int isAssignedByValue(PersistentMeta ptype) except? -123:
         cdef:
@@ -735,9 +729,9 @@ cdef class PHashTable(AssignedByReference):
         self.getP2IS()._used = 0
         cdef unsigned long hashTableSize = (actualSize *
                                             self.hashEntryClass.assignmentSize)
-        self.getP2IS().o2EntryTable = self.storage.allocate(hashTableSize)
-        memset(self.storage.baseAddress +
-               self.getP2IS().o2EntryTable, 0, hashTableSize)
+        self.getP2IS().o2EntryTable = self.allocate(hashTableSize)
+        memset(self.offset2Address(self.getP2IS().o2EntryTable),
+               0, hashTableSize)
         LOG.debug("Created new HashTable  {4} of type '{0}', "
                   "requested_size={1} actual size={2} allowed capacity={3}."
                   .format(self.ptype.__name__, size, actualSize,
@@ -942,10 +936,10 @@ cdef class PList(AssignedByReference):
 
     cdef CListEntry *newEntry(self, value, Offset* o2NewEntry):
         cdef PersistentMeta valueClass = (<ListMeta>(self.ptype)).valueClass
-        o2NewEntry[0] = self.storage.allocate(
+        o2NewEntry[0] = self.allocate(
             sizeof(CListEntry)  + valueClass.assignmentSize)
-        cdef CListEntry *p2NewEntry = <CListEntry *>(self.storage.baseAddress +
-                                                     o2NewEntry[0])
+        cdef CListEntry *p2NewEntry = (
+                           <CListEntry *>self.offset2Address(o2NewEntry[0]))
         valueClass.assign((<void*>p2NewEntry) +
                           (<ListMeta>(self.ptype)).o2Value,
                           value
@@ -971,8 +965,8 @@ cdef class PList(AssignedByReference):
         else:
             # Caveat!
             # http://stackoverflow.com/questions/11498441/what-is-this-kind-of-assignment-in-python-called-a-b-true
-            p2LastEntry =  <CListEntry *>(self.storage.baseAddress +
-                                          self.getP2IS().o2LastEntry)
+            p2LastEntry =  (
+                <CListEntry *>self.offset2Address(self.getP2IS().o2LastEntry))
             p2LastEntry.o2NextEntry = o2NewEntry
         self.getP2IS().o2LastEntry = o2NewEntry
 
@@ -982,7 +976,7 @@ cdef class PList(AssignedByReference):
             CListEntry   *p2Entry
             PersistentMeta valueClass = (<ListMeta>(self.ptype)).valueClass
         while o2Entry:
-            p2Entry = <CListEntry *>(self.storage.baseAddress + o2Entry)
+            p2Entry = <CListEntry *>(self.offset2Address(o2Entry))
             # LOG.info(p2Entry.o2 Value)
             yield valueClass.resolveAndCreateProxyFA(p2Entry + 1)
             o2Entry = p2Entry.o2NextEntry
@@ -1084,21 +1078,6 @@ cdef _addInheritedFields(StructureMeta ptype, bases, dict newFields):
                          "class {2} is ignored."
                          .format(fieldName, owner, ptype),
                          RuntimeWarning)
-                    deadcode = """
-                    inheritedFieldType = <PersistentMeta>fieldValue
-                    if inheritedFieldType.storage is not ptype.storage:
-                        raise TypeError("Cannot reuse persistent field "
-                                        "{0} defined in {1} of storage "
-                                        "{2} for the definition of a "
-                                        "persistent field in storage {3}."
-                                        .format(fieldName, owner,
-                                                ptype.storage.fileName,
-                                                inheritedFieldType.storage
-                                                    .fileName)
-                                        )
-                    _addInheritedField(ptype, owner, fieldName,
-                                       inheritedFieldType, newFields)
-                    """
 
 cdef _addInheritedField(StructureMeta ptype, base, str fieldName,
                         PersistentMeta inheritedFieldType, dict newFields):
@@ -1360,8 +1339,7 @@ cdef class PField(object):
 
     cdef Persistent get(PField self, PStructure owner):
         assert owner is not None
-        assert owner.storage is self.ptype.storage, (
-            owner.storage, self.ptype.storage)
+        owner.ptype.assertSameStorage(self.ptype)
 #         LOG.debug( bytes(('getting', hex(owner.offset), self.offset)) )
         return self.ptype.resolveAndCreateProxy(owner.offset + self.offset)
 
@@ -1579,10 +1557,6 @@ cdef class Trx(object):
         self.p2CRedoRecordHeader.offset = sourceAddress - \
             self.storage.baseAddress
         self.p2CRedoRecordHeader.length = length
-        # validate source range
-        assert sourceAddress > self.storage.baseAddress
-        assert self.p2CRedoRecordHeader.offset + \
-            length < self.storage.realFileSize
 #         cdef Offset newRedoOffset
         cdef void *redoRecordPayload = <void*>(self.p2CRedoRecordHeader+1)
         memcpy(redoRecordPayload, sourceAddress, length)

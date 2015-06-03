@@ -12,6 +12,22 @@ cdef class Persistent(object):
         Storage  storage
         void *p2InternalStructure
 
+    cdef inline void*  offset2Address(Persistent     self,
+                                      Offset         offset
+                                      ) except NULL:
+        return self.ptype.offset2Address(offset)
+
+    # TODO: move inline functions to module level
+    cdef inline Offset address2Offset(Persistent self, 
+                                      const void* address) except 0:
+        return self.ptype.address2Offset(address)
+
+    cdef inline bint isNullAddress(Persistent self, void* address):
+        return address == self.ptype.storage.baseAddress
+
+    cdef inline Offset allocate(self, int size) except 0:
+        return self.ptype.storage.allocate(size)
+
     cdef int richcmp(Persistent self, other, int op) except? -123
     cdef revive(Persistent p)
     cdef store(Persistent self, void *target)
@@ -43,14 +59,27 @@ cdef class PersistentMeta(type):
         type            proxyClass
         readonly str    __name__
 
+    cdef inline bint assertSameStorage(PersistentMeta ptype, 
+                                       PersistentMeta other):
+        ptype.storage.assertOwnClass(other)
+
     cdef inline void*  offset2Address(PersistentMeta ptype,
                                       Offset         offset
                                       ) except NULL:
         ptype.storage.assertNotClosed()
+        if ptype.storage.realFileSize < offset:
+            print(
+                "Corruption: offset {offset} is outside the mapped memory!"
+                " - Aborting.".format(offset=offset))
+            abort()
         return ptype.storage.baseAddress + offset
 
-    cdef inline Offset address2Offset(PersistentMeta ptype, void* address):
-        return address - ptype.storage.baseAddress
+    cdef inline Offset address2Offset(PersistentMeta ptype, 
+                                      const void* address):
+        assert address > ptype.storage.baseAddress
+        cdef Offset offset = address - ptype.storage.baseAddress
+        assert offset < ptype.storage.realFileSize
+        return offset
 
     cdef inline Persistent createProxyFA(PersistentMeta ptype, void* address):
         return ptype.createProxy(ptype.address2Offset(address))
@@ -70,7 +99,7 @@ cdef class PersistentMeta(type):
                                                    void*            address
                                                    ):
         return ptype.createProxy(ptype.resolve(ptype,
-                                               address - ptype.storage.baseAddress
+                                       address - ptype.storage.baseAddress
                                                )
                                  )
 
@@ -285,3 +314,7 @@ cdef class Storage(MemoryMappedFile):
         Offset                  allocate(self, int size) except 0
 
     cpdef object          internValue(Storage self, str typ, value)
+
+    cdef inline bint assertOwnClass(Storage self, 
+                                       PersistentMeta ptype):
+        assert ptype.storage is self, (self, ptype.storage)

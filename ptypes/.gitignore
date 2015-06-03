@@ -3,3 +3,4 @@
 /pcollections.c
 /query.c
 /storage.c
+/pagemanager.c

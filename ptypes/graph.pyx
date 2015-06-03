@@ -90,8 +90,7 @@ cdef class PNode(AssignedByReference):
             CEdgeKind *p2MatchingCEdgeKind = NULL
 
         while o2EdgeKind:
-            p2CEdgeKind = <CEdgeKind*>(self.ptype.storage.baseAddress +
-                                       o2EdgeKind)
+            p2CEdgeKind = <CEdgeKind*>(self.offset2Address(o2EdgeKind))
             if p2CEdgeKind.o2ClassName == edgeClass.o2Name:
                 p2MatchingCEdgeKind = p2CEdgeKind
                 break
@@ -100,9 +99,9 @@ cdef class PNode(AssignedByReference):
         if o2EdgeKind == 0:
             if createNew:
                 # create a new EdgeKind
-                o2EdgeKind = self.ptype.storage.allocate(sizeof(CEdgeKind))
+                o2EdgeKind = self.allocate(sizeof(CEdgeKind))
                 p2MatchingCEdgeKind = \
-                    <CEdgeKind*>(self.ptype.storage.baseAddress + o2EdgeKind)
+                    <CEdgeKind*>(self.offset2Address(o2EdgeKind))
                 p2MatchingCEdgeKind.o2NextEdgeKind = p2o2FirstEdgeKind[0]
                 p2MatchingCEdgeKind.o2ClassName = edgeClass.o2Name
                 p2o2FirstEdgeKind[0] = o2EdgeKind
@@ -119,8 +118,7 @@ cdef class PNode(AssignedByReference):
 
     # generators cannot be cpdef !
     def edges(PNode self, EdgeMeta edgeClass, EdgeDirection edgeDirection):
-        assert edgeClass.storage is self.ptype.storage, (edgeClass.storage,
-                                                         self.ptype.storage)
+        self.ptype.assertSameStorage(edgeClass)
         cdef:
             CEdgeKind       *p2CEdgeKind
             Offset   o2Edge      = 0
@@ -134,7 +132,7 @@ cdef class PNode(AssignedByReference):
         while o2Edge:
             #             print '  o2Edge', hex(o2Edge)
             yield edgeClass.createProxy(o2Edge)
-            p2edge = <CEdge*>(self.ptype.storage.baseAddress + o2Edge)
+            p2edge = <CEdge*>(self.offset2Address(o2Edge))
             if edgeDirection == In:  # optimize!
                 o2Edge = p2edge.o2NextEdgeOfToNode
             elif edgeDirection == Out:
@@ -179,15 +177,15 @@ cdef class EdgeMeta(PersistentMeta):
         ptype.o2Value = sizeof(CEdge)
         PersistentMeta.__init__(ptype, storage, className, proxyClass,
                                 ptype.o2Value + valueClass.assignmentSize)
+        storage.assertOwnClass(valueClass)
+        storage.assertOwnClass(fromNodeClass)
+        storage.assertOwnClass(toNodeClass)
         ptype.valueClass     =  valueClass
-        assert ptype.valueClass.storage == storage
         ptype.fromNodeClass  =  fromNodeClass
-        assert ptype.fromNodeClass.storage == storage
         ptype.toNodeClass  =  toNodeClass
-        assert ptype.toNodeClass.storage == storage
 
-        ptype.o2Name = storage\
-            .stringRegistry.get(ptype.__name__.encode('utf8')).offset
+        ptype.o2Name = storage.stringRegistry\
+            .get(ptype.__name__.encode('utf8')).offset
 
     def reduce(ptype):
         return ('_typedef', ptype.__name__, ptype.__class__, ptype.proxyClass,
@@ -214,10 +212,8 @@ cdef class PEdge(AssignedByReference):
                  Persistent value=None):
         cdef EdgeMeta edgeClass = <EdgeMeta>self.ptype
 #         print '_init_', self.offset, edgeClass.o2Name
-        assert fromPNode.ptype.storage is edgeClass.storage, \
-            (fromPNode.ptype.storage, edgeClass.storage)
-        assert toPNode.ptype.storage is edgeClass.storage, \
-            (toPNode.ptype.storage, edgeClass.storage)
+        edgeClass.assertSameStorage(fromPNode.ptype)
+        edgeClass.assertSameStorage(toPNode.ptype)
         if fromPNode.ptype != edgeClass.fromNodeClass:
             raise ValueError("{0} expects an instance of {expected} as "
                              "fromNode, not a {fromPNode.ptype} instance"
@@ -427,9 +423,8 @@ cdef class FindEdge(BindingRule):
         else:
             assert False, "both self.toNodeBindingRule and "\
                 "self.fromNodeBindingRule are None!"
-        cdef Storage storage = query.storage
         cdef:
-            EdgeMeta edgeClass = getattr(storage.schema, self.edgeKind)
+            EdgeMeta edgeClass = getattr(query.storage.schema, self.edgeKind)
             PEdge edge
         for edge in knownNode.edges(edgeClass, self.edgeDirection):
             if otherNode is None or edge.getToNode() == otherNode:
