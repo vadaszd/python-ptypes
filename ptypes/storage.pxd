@@ -1,28 +1,23 @@
 from libc.stdlib cimport abort
 
+from .pagemanager cimport Trx
+
+
 ctypedef unsigned long Offset
+
 
 cdef class Persistent(object):
     """ Base class for all the proxy classes for persistent objects.
     """
     cdef:
-        readonly Offset offset
+        readonly Offset         offset
         readonly PersistentMeta ptype
-        Storage  storage
-        void *p2InternalStructure
-
-    cdef inline void*  offset2Address(Persistent     self,
-                                      Offset         offset
-                                      ) except NULL:
-        return self.ptype.offset2Address(offset)
+        Trx                     trx
+        void                   *p2InternalStructure
 
     # TODO: move inline functions to module level
-    cdef inline Offset address2Offset(Persistent self, 
-                                      const void* address) except 0:
-        return self.ptype.address2Offset(address)
-
     cdef inline bint isNullAddress(Persistent self, void* address):
-        return address == self.ptype.storage.baseAddress
+        return address == self.trx.region.baseAddress
 
     cdef inline Offset allocate(self, int size) except 0:
         return self.ptype.storage.allocate(size)
@@ -31,17 +26,21 @@ cdef class Persistent(object):
     cdef revive(Persistent p)
     cdef store(Persistent self, void *target)
 
+
 # p2InternalStructure points at a persistent object embedded inside
 # another persistent object
 cdef class AssignedByValue(Persistent):
     pass
 
+
 # p2InternalStructure points at a stand-alone object on the heap
 cdef class AssignedByReference(Persistent):
     pass
 
+
 cdef inline Offset allocateStorage(PersistentMeta ptype) except 0:
     return ptype.storage.allocate(ptype.allocationSize)
+
 
 cdef class PersistentMeta(type):
     """ Abstract base meta class for all persistent types.
@@ -53,7 +52,8 @@ cdef class PersistentMeta(type):
         # used in assignments, must equal to allocationSize when the assignment
         # semantics of the type is store-by-value
         int             assignmentSize
-        Offset(*resolve)(PersistentMeta ptype, Offset offset) except -1
+        Offset(*resolve)(PersistentMeta ptype, Trx trx, 
+                         Offset offset) except -1
 
         type            proxyClass
         readonly str    __name__
@@ -62,43 +62,29 @@ cdef class PersistentMeta(type):
                                        PersistentMeta other):
         ptype.storage.assertOwnClass(other)
 
-    cdef inline void*  offset2Address(PersistentMeta ptype,
-                                      Offset         offset
-                                      ) except NULL:
-        ptype.storage.assertNotClosed()
-        if ptype.storage.realFileSize < offset:
-            print(
-                "Corruption: offset {offset} is outside the mapped memory!"
-                " - Aborting.".format(offset=offset))
-            abort()
-        return ptype.storage.baseAddress + offset
+    cdef inline Persistent createProxyFA(PersistentMeta ptype, 
+                                         Trx trx, 
+                                         void* address):
+        return ptype.createProxy(trx, trx.address2Offset(address))
 
-    cdef inline Offset address2Offset(PersistentMeta ptype, 
-                                      const void* address):
-        assert address > ptype.storage.baseAddress
-        cdef Offset offset = address - ptype.storage.baseAddress
-        assert offset < ptype.storage.realFileSize
-        return offset
-
-    cdef inline Persistent createProxyFA(PersistentMeta ptype, void* address):
-        return ptype.createProxy(ptype.address2Offset(address))
-
-    cdef Persistent createProxy(PersistentMeta ptype, Offset offset)
+    cdef Persistent createProxy(PersistentMeta ptype, Trx trx, Offset offset)
 
     # The resolveAndCreateProxy* methods require a pointer or an offset to
     # an "embedded" area (e.g. fields). *Never* invoke these methods on
     # pointers/offsets at areas containing a by-ref object!
     # They create a proxy out of ptype.
     cdef inline Persistent resolveAndCreateProxy(PersistentMeta ptype,
+                                                 Trx trx, 
                                                  Offset offset
                                                  ):
-        return ptype.createProxy(ptype.resolve(ptype, offset))
+        return ptype.createProxy(trx, ptype.resolve(ptype, offset))
 
     cdef inline Persistent resolveAndCreateProxyFA(PersistentMeta   ptype,
+                                                   Trx trx, 
                                                    void*            address
                                                    ):
-        return ptype.createProxy(ptype.resolve(ptype,
-                                       address - ptype.storage.baseAddress
+        return ptype.createProxy(trx, ptype.resolve(ptype,
+                                       address - trx.region.baseAddress
                                                )
                                  )
 
@@ -106,6 +92,7 @@ cdef class PersistentMeta(type):
     cdef assign(PersistentMeta ptype, void *target, source, )
     cdef int isAssignedByValue(PersistentMeta ptype) except? -123
     cdef assertType(PersistentMeta ptype, Persistent persistent)
+
 
 cdef class TypeDescriptor(object):
     # In derived classes the below class-attributes must be added:
@@ -118,20 +105,28 @@ cdef class TypeDescriptor(object):
         readonly str className
         readonly tuple typeParameters
 
+
 cdef class Int(TypeDescriptor):
     pass
+
 cdef class Float(TypeDescriptor):
     pass
+
 cdef class __ByteString(TypeDescriptor):
     pass
+
 cdef class Set(TypeDescriptor):
     pass
+
 cdef class Dict(TypeDescriptor):
     pass
+
 cdef class DefaultDict(Dict):
     pass
+
 cdef class List(TypeDescriptor):
     pass
+
 
 cdef:
     struct CHashTable:
@@ -141,18 +136,22 @@ cdef:
     struct CHashEntry:
         bint isUsed
 
+
 cdef class HashEntryMeta(PersistentMeta):
     cdef:
         PersistentMeta keyClass
         PersistentMeta valueClass
         Offset o2Key, o2Value           # offsets from the head of the entry!
 
+
 cdef class PHashEntry(AssignedByValue):
     pass
+
 
 cdef class HashTableMeta(PersistentMeta):
     cdef:
         HashEntryMeta hashEntryClass
+
 
 cdef class PHashTable(AssignedByReference):
     cdef:
@@ -175,7 +174,7 @@ cdef class PHashTable(AssignedByReference):
                 i*self.hashEntryClass.assignmentSize)
 
     cdef inline CHashEntry* getP2Entry(self, unsigned long i):
-        return <CHashEntry*><unsigned long>(self.ptype.storage.baseAddress +
+        return <CHashEntry*><unsigned long>(self.trx.region.baseAddress +
                                             self.getO2Entry(i)
                                             )
 
@@ -207,8 +206,10 @@ cdef class PHashTable(AssignedByReference):
     cdef inline setValue(self, CHashEntry* p2Entry, value):
         self.valueClass.assign(self.getP2Value(p2Entry), value)
 
+
 cdef class PDefaultHashTable(PHashTable):
     pass
+
 
 cdef class PByteString(AssignedByReference):
     cdef inline char *getCharPtr(self):
@@ -220,16 +221,20 @@ cdef class PByteString(AssignedByReference):
     cdef inline bytes getByteString(self):
         return self.getCharPtr()[:self.getSize()]
 
+
 cdef struct CList:
     Offset o2FirstEntry, o2LastEntry
 
+
 cdef struct CListEntry:
     Offset o2NextEntry  # o2Value is handled dynamically
+
 
 cdef class ListMeta(PersistentMeta):
     cdef:
         PersistentMeta valueClass
         Offset o2Value
+
 
 cdef class PList(AssignedByReference):
 
@@ -240,6 +245,7 @@ cdef class PList(AssignedByReference):
     cpdef insert(PList self, object value)
     cpdef append(PList self, object value)
 
+
 cdef class StructureMeta(PersistentMeta):
     cdef:
         readonly   list    fields    # list of (name, ptype.__name__) tuples
@@ -248,9 +254,11 @@ cdef class StructureMeta(PersistentMeta):
 
     cdef addField(StructureMeta ptype, name, PersistentMeta fieldType)
 
+
 cdef class PStructure(AssignedByReference):
     cdef get(PStructure self)
     cdef set(PStructure self, value)
+
 
 cdef class PField(object):
     cdef:
@@ -261,27 +269,30 @@ cdef class PField(object):
         object      set(PField self, PStructure owner, value)
         Persistent  get(PField self, PStructure owner)
 
+
 cdef struct CStorageHeader:
     Offset freeOffset, o2ByteStringRegistry, o2PickledTypeList, o2Root
 
+
 cdef class Storage(object):
     cdef:
-        CStorageHeader       *p2FileHeader
+        BackingFile             backingFile
+        Trx                     trx
 
         long                    stringRegistrySize
-        readonly bint           createTypes
         readonly                schema  # ModuleType
         list                    typeList
-
-        # Persistent objects
-        PList                   pickledTypeList
-        Persistent              __root
-        readonly PHashTable     stringRegistry
 
         object                  registerType(self, PersistentMeta ptype)
         Offset                  allocate(self, int size) except 0
 
-    cpdef object          internValue(Storage self, str typ, value)
+        # Fields depending on the current transaction objects
+        CStorageHeader         *p2StorageHeader
+        Persistent              __root
+        readonly PHashTable     stringRegistry
+
+    cpdef object    internValue(Storage self, str typ, value)
+    cpdef Trx       setTrx(self, Trx trx)
 
     cdef inline bint assertOwnClass(Storage self, 
                                        PersistentMeta ptype):

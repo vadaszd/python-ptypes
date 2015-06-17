@@ -17,14 +17,14 @@ cdef struct CSkipNode:
 
 cdef inline CSkipNode* getNextAtLevel(PSkipList self, CSkipNode *p2CSkipNode,
                                       int level) except NULL:
-    cdef CSkipNode *x = (<CSkipNode* > (self.offset2Address(
-        (<unsigned long*>(self.offset2Address(p2CSkipNode.o2Next)))[level])))
+    cdef CSkipNode *x = (<CSkipNode* > (self.trx.offset2Address(
+        (<unsigned long*>(self.trx.offset2Address(p2CSkipNode.o2Next)))[level])))
     # print 'getNextAtLevel', hex(<unsigned long><void*>x)
     return x
 cdef inline setNextAtLevel(PSkipList self, CSkipNode *p2CSkipNode, int level,
                            CSkipNode* p2):
-    (<unsigned long *>(self.offset2Address(p2CSkipNode.o2Next)))[level] = \
-        self.address2Offset(p2)
+    (<unsigned long *>(self.trx.offset2Address(p2CSkipNode.o2Next)))[level] = \
+        self.trx.address2Offset(p2)
 
 
 cdef class SkipNodeMeta(PersistentMeta):
@@ -125,7 +125,7 @@ cdef class PSkipNode(AssignedByReference):
 
 cdef CSkipNode2str(PSkipList self, CSkipNode *node):
     return "[@offset={0} key={1} o2Value={2} o2Next={3} #lvls={4}]"\
-        .format(hex(self.address2Offset(node)),
+        .format(hex(self.trx.address2Offset(node)),
                 'node.key', 'hex(node.o2Value)', hex(node.o2Next),
                 node.numberOfLevels)  # XXX print key properly
 
@@ -216,7 +216,7 @@ cdef class PSkipList(AssignedByReference):
             print 'END'
 
     cdef inline CSkipNode *getHead(PSkipList self):
-        return <CSkipNode *>(self.offset2Address(self.getP2IS().o2Head))
+        return <CSkipNode *>(self.trx.offset2Address(self.getP2IS().o2Head))
 
     def __iter__(PSkipList self):
         return self.range(None, None)
@@ -241,7 +241,7 @@ cdef class PSkipList(AssignedByReference):
             while True:
                 if self.isNullAddress(cSkipNode):
                     break
-                skipNode = entryClass.createProxyFA(cSkipNode)
+                skipNode = entryClass.createProxyFA(self.trx, cSkipNode)
                 if to is not None and skipNode >= to:
                     break
                 yield skipNode.getValue()
@@ -268,7 +268,8 @@ cdef class PSkipList(AssignedByReference):
                                                      nodeAtLevel, level)
                     if self.isNullAddress(nextNodeAtLevel):
                         break
-                    skipNode = entryClass.createProxyFA(nextNodeAtLevel)
+                    skipNode = entryClass.createProxyFA(self.trx, 
+                                                        nextNodeAtLevel)
                     if skipNode >= value:
                         break
                     nodeAtLevel = nextNodeAtLevel
@@ -293,7 +294,7 @@ cdef class PSkipList(AssignedByReference):
             cSkipNode = getNextAtLevel(self, cutList[0], 0)
             free(cutList)
             if not self.isNullAddress(cSkipNode):
-                skipNode = entryClass.createProxyFA(cSkipNode)
+                skipNode = entryClass.createProxyFA(self.trx, cSkipNode)
                 if skipNode == key:
                     return cSkipNode
         raise KeyError(key)
@@ -302,7 +303,8 @@ cdef class PSkipList(AssignedByReference):
         cdef:
             CSkipNode *cSkipNode = self.find(key)
             PersistentMeta entryClass = (<SkipListMeta>self.ptype).entryClass
-        return (<PSkipNode>entryClass.createProxyFA(cSkipNode)).getValue()
+        return (<PSkipNode>entryClass.createProxyFA(self.trx, 
+                                                    cSkipNode)).getValue()
 
     def insert(self, object value):
         cdef:
@@ -314,9 +316,9 @@ cdef class PSkipList(AssignedByReference):
 
         level = self.randomLevel()
         if head.numberOfLevels < level:
-            next = <Offset *>(self.offset2Address(head.o2Next))
+            next = <Offset *>(self.trx.offset2Address(head.o2Next))
             head.o2Next = self.allocate(sizeof(Offset)*level)
-            newNext = <Offset *>(self.offset2Address(head.o2Next))
+            newNext = <Offset *>(self.trx.offset2Address(head.o2Next))
             for i in range(head.numberOfLevels):
                 newNext[i] = next[i]
             for i in range(head.numberOfLevels, level):

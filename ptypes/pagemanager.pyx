@@ -21,6 +21,7 @@ from posix.signal cimport sigaction, sigemptyset, SA_SIGINFO
 from libc.stdio cimport perror
 from libc.errno cimport errno
 from libc.stdlib cimport malloc, free
+from libc.string import strerror, memcpy
 
 cdef char *ptypesMagic     = "ptypes-0.6.0"       # Maintained by bumpbersion,
 cdef char *ptypesRedoMagic = "redo-ptypes-0.6.0"  # no manual changes please!
@@ -28,33 +29,28 @@ cdef char *ptypesRedoMagic = "redo-ptypes-0.6.0"  # no manual changes please!
 cdef extern from "errno.h":
     int errno
 
-cdef extern from "string.h":
-    char *strerror(int errnum)
+# cdef extern from "string.h":
+#     char *strerror(int errnum)
+#     void *memcpy(void dest, const void src, size_t n)
 
 
 import os
 
-cdef struct CRegionHeader:
-    char magic[lengthOfMagic]
-    char status
-    unsigned long revision
-    unsigned long lastAppliedRedoFileNumber
-    Offset o2lastAppliedTrx
 
+cdef class BackingFile(object):
 
-cdef class MemoryMappedFile(object):
-
-    def __init__(self, str fileName, int numPages=0):
+    def __init__(self, str fileName, size_t fileSize=0):
         self.fileName = fileName
         try:
             self.fd = os.open(self.fileName, os.O_RDWR)
         except OSError:
+            self.numPages = (0 if fileSize==0 else 
+                             (fileSize-1)/pagesize + 1 + numMetadata)
             LOG.debug("Creating new file '{self.fileName}'".format(self=self))
             assert numPages > 0, ('The database cannot have {numPages} pages.'
                                   .format(numPages=self.numPages)
                                   )
             self.isNew = 1
-            self.numPages = numPages
             self.realFileSize = self.numPages * pagesize
             self.fd = os.open(self.fileName, O_CREAT | O_RDWR)
             os.lseek(self.fd, self.realFileSize-1, SEEK_SET)
@@ -71,6 +67,87 @@ cdef class MemoryMappedFile(object):
             self._initialize()
         else:
             self._mount()
+        LOG.debug("Highest metadata revision is {0}"
+                  .format(self.p2HiHeader.revision))
+        LOG.debug("Lowest metadata revision is {0}"
+                  .format(self.p2LoHeader.revision))
+        LOG.debug("Using metadata revision {0}"
+                  .format(self.p2FileHeader.revision))
+        if not self.isNew and fileSize > self.realFileSize:
+            raise Exception("File {self.fileName} is of size "
+                            "{self.realFileSize}, cannot resize it to "
+                            "{fileSize}.".format(self=self, fileSize=fileSize)
+                            )
+
+    def _initialize(self):
+        LOG.info("Initializing new file '{self.fileName}'".format(self=self))
+        assert len(ptypesMagic) < lengthOfMagic
+        cdef int i
+
+        for i in range(numMetadata):
+            self.p2FileHeader = self.p2FileHeaders[i] = \
+                            <CStorageHeader*>self.baseAddress + i*pagesize
+            memcpy(self.p2FileHeader.magic, ptypesMagic, len(ptypesMagic))
+            self.p2FileHeader.status = 'C'
+            self.p2FileHeader.revision = i
+            self.p2FileHeader.freeOffset = numMetadata*pagesize
+
+        self.p2FileHeader.status = 'D'
+        self.p2LoHeader = self.p2FileHeaders[0]
+        self.p2HiHeader = self.p2FileHeaders[1]
+
+    def _mount(self):
+        LOG.info("Mounting existing file '{self.fileName}'".format(self=self))
+        self.p2HiHeader = self.p2LoHeader = NULL
+
+        cdef int i
+        for i in range(numMetadata):
+            self.p2FileHeader = self.p2FileHeaders[i] = \
+                <CStorageHeader*>self.baseAddress + i*pagesize
+            if any(self.p2FileHeader.magic[j] != ptypesMagic[j]
+                   for j in range(len(ptypesMagic))
+                   ):
+                raise Exception('File {self.fileName} is incompatible with '
+                                'this version of ptypes!'.format(
+                                    self=self)
+                                )
+            if (self.p2LoHeader == NULL or
+                    self.p2LoHeader.revision > self.p2FileHeader.revision):
+                self.p2LoHeader = self.p2FileHeader
+            if (self.p2HiHeader == NULL or
+                    self.p2HiHeader.revision < self.p2FileHeader.revision):
+                self.p2HiHeader = self.p2FileHeader
+
+        if self.p2HiHeader.status != 'C':  # roll back
+            LOG.info(
+                "Latest shutdown was incomplete, restoring previous metadata.")
+            self.p2FileHeader = self.p2HiHeader
+            self.p2FileHeader[0] = self.p2LoHeader[0]
+            if self.p2HiHeader.status != 'C':
+                raise Exception("No clean metadata could be found!")
+        else:
+            LOG.debug("Latest shutdown was clean, using latest metadata.")
+            self.p2FileHeader = self.p2LoHeader
+            self.p2FileHeader[0] = self.p2HiHeader[0]
+
+        self.p2FileHeader.status = 'D'
+        self.p2FileHeader.revision += 1
+
+    def __flush(self):
+        self.assertNotClosed()
+        BackingFile.flush(self)
+        self.p2FileHeader.status = 'C'
+        BackingFile.flush(self)
+
+    cpdef flush(self, bint async=False):
+        LOG.debug("Flushing {}".format(self))
+        self.__flush()
+        cdef CStorageHeader *p2FileHeader = self.p2FileHeader
+        cdef unsigned long revision = p2FileHeader.revision + 1
+        self.p2FileHeader = self.p2FileHeaders[revision % numMetadata]
+        self.p2FileHeader[0] = p2FileHeader[0]
+        self.p2FileHeader.revision = revision
+        self.p2FileHeader.status = 'D'
 
     cpdef close(self):
         self.assertNotClosed()
@@ -82,19 +159,10 @@ cdef class MemoryMappedFile(object):
                 .format(self=self))
 
 
-cdef struct CProtectedRegion:
-    void *baseAddress
-    size_t length
-    void *endAddress
-    CRegionHeader       *p2FileHeaders[numMetadata]
-    CRegionHeader       *p2HiHeader
-    CRegionHeader       *p2LoHeader
-
-
-cdef str CProtectedRegion__format(CProtectedRegion* region,
-                                  str message,
-                                  int error=0,
-                                  fileName=None) except NULL:
+cdef str CProtectedRegion__formatErrorMessage(CProtectedRegion* region,
+                                              str message,
+                                              int error=0,
+                                              fileName=None) except NULL:
     return message.format(
                     baseAddress=hex(<unsigned long>region.baseAddress),
                     length=hex(region.length),
@@ -102,60 +170,58 @@ cdef str CProtectedRegion__format(CProtectedRegion* region,
                     fileName=fileName))
 
 
-cdef CProtectedRegion* CProtectedRegion_new(MemoryMappedFile memoryMappedFile
+cdef CProtectedRegion* CProtectedRegion_new(BackingFile backingFile
                                             ) except NULL:
     cdef CProtectedRegion *region
     region = <CProtectedRegion *>malloc(sizeof(CProtectedRegion))
-    region.length = memoryMappedFile.realFileSize
+    region.length = backingFile.realFileSize
     region.baseAddress = mmap(NULL, region.length, 
                                    PROT_READ, MAP_SHARED, 
-                                   memoryMappedFile.fd, 0)
+                                   backingFile.fd, 0)
     if region.baseAddress == MAP_FAILED:
         #error = errno  # save it, any c-lib call may overwrite it!
         raise RuntimeError(
-            CProtectedRegion__format('Could not map {fileName}: {error}',
-                                     errno,
-                                     fileName=memoryMappedFile.fileName)
-                           )
+            CProtectedRegion__formatErrorMessage('Could not map '
+                                                 '{fileName}: {error}',
+                                                 errno,
+                                     fileName=backingFile.fileName)
+                                     )
     region.endAddress = region.baseAddress + region.length
-    LOG.debug( CProtectedRegion__format(
+    LOG.debug( CProtectedRegion__formatErrorMessage(
             'Mmapped {fileName} memory region {baseAddress}-{length}'))
     if mprotect(region.baseAddress, region.length, PROT_READ):
-        raise RuntimeError(CProtectedRegion__format(
+        raise RuntimeError(CProtectedRegion__formatErrorMessage(
             "Could not protect the memory mapped region "
             "{baseAddress}-{length}: {error}", errno))
     return region
 
 
 cdef CProtectedRegion_delete(CProtectedRegion* region) except NULL:
-    LOG.debug(CProtectedRegion__format(
+    LOG.debug(CProtectedRegion__formatErrorMessage(
                     'Unmapping memory region {baseAddress}-{length}'))
     if munmap(region.baseAddress, region.length):
-        raise RuntimeError('Could not unmap {baseAddress}-{length}: {error}',
-                           errno)
+        raise RuntimeError(CProtectedRegion__formatErrorMessage(
+            'Could not unmap {baseAddress}-{length}: {error}', errno))
     region.baseAddress = NULL
     free(region)
 
 
 cdef CProtectedRegion_flush(CProtectedRegion* region, bint async=0
                             ) except NULL:
-    LOG.debug(CProtectedRegion__format(
+    LOG.debug(CProtectedRegion__formatErrorMessage(
                     'Msyncing memory region {baseAddress}-{length}'))
     if msync(self.region.baseAddress, self.region.length,
              MS_ASYNC if async else MS_SYNC):
-        raise RuntimeError('Could not sync {baseAddress}-{length}: {error}',
-                           errno, 
-                           )
+        raise RuntimeError(CProtectedRegion__formatErrorMessage(
+            'Could not sync {baseAddress}-{length}: {error}', errno))
 
 
 cdef class Trx(object):
-    cdef:
-        MemoryMappedFile    memoryMappedFile
-        CProtectedRegion    *region
-
-    def __cinit__(self, MemoryMappedFile memoryMappedFile):
-        self.memoryMappedFile = memoryMappedFile
-        self.region =CProtectedRegion_new(memoryMappedFile)
+    """ An atomically updateable memory region mapped into a file
+    """
+    def __cinit__(self, BackingFile backingFile):
+        self.backingFile = backingFile
+        self.region =CProtectedRegion_new(backingFile)
 
     def __dealloc__(self):
         global currentRegion
@@ -165,7 +231,7 @@ cdef class Trx(object):
             CProtectedRegion_delete(self.region)
             self.region = NULL
 
-    def __init__(self, MemoryMappedFile memoryMappedFile):
+    def __init__(self, BackingFile backingFile):
         self.resume()
 
     cdef Trx resume(Trx self):
@@ -175,6 +241,30 @@ cdef class Trx(object):
         currentRegion = self.region
         return oldTrx
 
+    cdef Trx close(Trx self, type Persistent, bint doCommit):
+        LOG.debug("Closing {}".format(self))
+        self.trx.assertNotClosed()
+        suspects = [o for o in gc.get_referrers(self)
+                    if (isinstance(o, Persistent) and
+                        o not in [self.__root, self.stringRegistry]
+                        )
+                    ]
+        if suspects:
+            LOG.warning('The following proxy objects are probably part of a '
+                        'reference cycle: \n{}' .format(suspects)
+                        )
+        gc.collect()
+        suspects = [o for o in gc.get_referrers(self)
+                    if (isinstance(o, Persistent) and
+                        o not in [self.__root, self.stringRegistry]
+                        )
+                    ]
+        if suspects:
+            raise ValueError("Cannot close {} - some proxies are still around:"
+                             " {}".format(
+                                 self, ' '.join([repr(s) for s in suspects]))
+                             )
+        self.__flush()
 
 cdef initPageManager():
     cdef sigaction_t action
@@ -185,7 +275,7 @@ cdef initPageManager():
 
     action.sa_flags = SA_SIGINFO
 
-    if sigaction(SIGSEGV, &action, &originalSigSegAction): #SIGSEGV
+    if sigaction(SIGSEGV, &action, &originalSigSegAction): 
         raise RuntimeError("Could not install the signal handler for "
                            "segmentation faults.")
 
@@ -226,13 +316,13 @@ initPageManager()
 #     # i.e. the length & checksum of the trx header are zeros)
 #     Offset o2firstTrx, o2Tail
 # 
-# cdef class Redo(MemoryMappedFile):
+# cdef class Redo(BackingFile):
 #     cdef:
 #         CRedoFileHeader       *p2FileHeader
 #         CTrxHeader            *p2Tail
 # 
 #     def __init__(self, str fileName, int numPages=0):
-#         MemoryMappedFile.__init__(self, fileName, numPages)
+#         BackingFile.__init__(self, fileName, numPages)
 #         cdef:
 #             MD5_CTX md5Context
 #             MD5_checksum checksum

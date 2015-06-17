@@ -90,7 +90,7 @@ cdef class PNode(AssignedByReference):
             CEdgeKind *p2MatchingCEdgeKind = NULL
 
         while o2EdgeKind:
-            p2CEdgeKind = <CEdgeKind*>(self.offset2Address(o2EdgeKind))
+            p2CEdgeKind = <CEdgeKind*>(self.trx.offset2Address(o2EdgeKind))
             if p2CEdgeKind.o2ClassName == edgeClass.o2Name:
                 p2MatchingCEdgeKind = p2CEdgeKind
                 break
@@ -101,7 +101,7 @@ cdef class PNode(AssignedByReference):
                 # create a new EdgeKind
                 o2EdgeKind = self.allocate(sizeof(CEdgeKind))
                 p2MatchingCEdgeKind = \
-                    <CEdgeKind*>(self.offset2Address(o2EdgeKind))
+                    <CEdgeKind*>(self.trx.offset2Address(o2EdgeKind))
                 p2MatchingCEdgeKind.o2NextEdgeKind = p2o2FirstEdgeKind[0]
                 p2MatchingCEdgeKind.o2ClassName = edgeClass.o2Name
                 p2o2FirstEdgeKind[0] = o2EdgeKind
@@ -131,8 +131,8 @@ cdef class PNode(AssignedByReference):
             o2Edge = p2CEdgeKind.o2FirstEdge
         while o2Edge:
             #             print '  o2Edge', hex(o2Edge)
-            yield edgeClass.createProxy(o2Edge)
-            p2edge = <CEdge*>(self.offset2Address(o2Edge))
+            yield edgeClass.createProxy(self.trx, o2Edge)
+            p2edge = <CEdge*>(self.trx.offset2Address(o2Edge))
             if edgeDirection == In:  # optimize!
                 o2Edge = p2edge.o2NextEdgeOfToNode
             elif edgeDirection == Out:
@@ -249,11 +249,11 @@ cdef class PEdge(AssignedByReference):
 
     cdef PNode getFromNode(PEdge self):
         cdef EdgeMeta edgeClass = <EdgeMeta>self.ptype
-        return edgeClass.fromNodeClass.createProxy(self.getP2IS().o2FromNode)
+        return edgeClass.fromNodeClass.createProxy(self.trx, self.getP2IS().o2FromNode)
 
     cdef PNode getToNode(PEdge self):
         cdef EdgeMeta edgeClass = <EdgeMeta>self.ptype
-        return edgeClass.toNodeClass.createProxy(self.getP2IS().o2ToNode)
+        return edgeClass.toNodeClass.createProxy(self.trx, self.getP2IS().o2ToNode)
 
     property fromNode:
         def __get__(PEdge self):

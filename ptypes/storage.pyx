@@ -52,11 +52,13 @@ cdef class Persistent(object):
         return bool(self.richcmp(other, op))
 
     property id:
-        """ Read-only property giving a tuple uniquely identifies the object.
+        """ Read-only property giving a tuple uniquely identifying the object.
+
+        The returned value is valid within the current transaction only.
         """
 
         def __get__(self):
-            return id(self.storage), self.offset
+            return id(self.trx), self.offset
 
     def isSameAs(Persistent self, Persistent other):
         """ Compare the identity of :class:`Persistent` instances.
@@ -71,7 +73,7 @@ cdef class Persistent(object):
         :return: ``True`` if ``self`` refers to the same persistent object as
                     ``other``, otherwise ``False``.
         """
-        return self.offset == other.offset and self.storage is other.storage
+        return self.offset == other.offset and self.trx is other.trx
 
     cdef int richcmp(Persistent self, other, int op) except? -123:
         raise NotImplementedError()
@@ -121,13 +123,13 @@ cdef class AssignedByValue(Persistent):
 # ================ Assignment By Reference ================
 
 cdef Offset resolveReference(PersistentMeta ptype, Offset offset) except -1:
-    return (<Offset*>ptype.offset2Address(offset))[0]
+    return (<Offset*>ptype.storage.trx.offset2Address(offset))[0]
 
 cdef class AssignedByReference(Persistent):
     # p2InternalStructure points at a stand-alone object on the heap
     cdef store(AssignedByReference self, void *target):
         # store the offset to the value
-        (<Offset*>target)[0] = self.address2Offset(self.p2InternalStructure)
+        (<Offset*>target)[0] = self.trx.address2Offset(self.p2InternalStructure)
 
     # works only with persistent values. Can be specialized in derived
     # classes for specific types.
@@ -223,17 +225,18 @@ cdef class PersistentMeta(type):
                 'only be instantiated inside a container (e.g. in Structure)'
                 .format(ptype=ptype))
         # always by ref
-        cdef Persistent self = ptype.createProxy(allocateStorage(ptype))
+        cdef Persistent self = ptype.createProxy(ptype.storage.trx, 
+                                                 allocateStorage(ptype))
         ptype.proxyClass.__init__(self, *args, **kwargs)
         return self
 
-    cdef Persistent createProxy(PersistentMeta ptype, Offset offset):
+    cdef Persistent createProxy(PersistentMeta ptype, Trx trx, Offset offset):
         cdef Persistent self
         if offset:
             self = ptype.__new__(ptype)
-            self.p2InternalStructure =  ptype.offset2Address(offset)
+            self.p2InternalStructure =  trx.offset2Address(offset)
             self.ptype = ptype
-            self.storage = ptype.storage
+            self.trx = trx
             self.offset = offset
 #             LOG.debug('createProxy: {0} {1} ==> {2}'
 #                        .format(ptype.proxyClass, offset, repr(self)))
@@ -245,30 +248,34 @@ cdef class PersistentMeta(type):
     def reduce(self):
         return '_typedef', self.__name__, self.__class__, self.proxyClass
 
-    cdef assign(PersistentMeta ptype, void *target, source, ):
+    cdef assign(PersistentMeta ptype, Trx targetTrx, void *target, source, ):
         """ Assign source to target converting to persistent if needed.
 
             If ``source`` is a persistent type then it must be an instance of
-            the type represented by ``ptype``. If it is a volatile Python value
+            the type represented by ``ptype`` in ``targetTrx``. If it is a volatile Python value
             and the type represented by ``ptype`` is assigned by value, then
             the assignment is performed via the ``contents`` descriptor of the
             type. For types assigned by reference a new instance of the type is
-            created and ``source`` is passed to the constructor, unless it is
+            created in ``targetTrx`` and ``source`` is passed to the constructor, unless it is
             ``None``, in which case the reference is set to the persistent
             representation of ``None``.
         """
+        cdef Persistent self
         if isinstance(source, Persistent):
             ptype.assertType(source)
+            source.assertInTrx(targetTrx)
             (<Persistent>source).store(target)
         elif ptype.isAssignedByValue():
-            ptype.resolveAndCreateProxyFA(target).contents = source
+            ptype.resolveAndCreateProxyFA(targetTrx, target).contents = source
         elif source is None:
             (<Offset*>target)[0] = 0
         else:
-            (<Persistent>ptype(source)).store(target)
+            self = <Persistent>ptype(source)
+            self.assertInTrx(targetTrx)
+            self.store(target)
 
     cdef void clear(PersistentMeta ptype, Offset o2Target):
-        memset(ptype.offset2Address(o2Target), 0, ptype.assignmentSize)
+        memset(ptype.storage.trx.offset2Address(o2Target), 0, ptype.assignmentSize)
 
     cdef int isAssignedByValue(PersistentMeta ptype) except? -123:
         cdef:
@@ -287,10 +294,10 @@ cdef class PersistentMeta(type):
 
     cdef assertType(PersistentMeta ptype, Persistent persistent):
         if persistent:
-            if persistent.ptype.storage is not ptype.storage:
+            if persistent.trx is not ptype.storage.trx:
                 raise ValueError(
                     "Expected a persistent object in {0}, not in {1}!"
-                    .format(ptype.storage, persistent.ptype.storage)
+                    .format(ptype.storage.trx, persistent.trx)
                 )
             if not issubclass(persistent.ptype, ptype):
                 raise TypeError(
@@ -516,7 +523,8 @@ cdef class ByteStringMeta(PersistentMeta):
             int size = len(volatileByteString)
 
             PByteString self = \
-                ptype.createProxy(ptype.storage.allocate(sizeof(int) + size))
+                ptype.createProxy(ptype.storage.trx,
+                                  ptype.storage.allocate(sizeof(int) + size))
 
         (<int*>self.p2InternalStructure)[0] = size
         memcpy(self.getCharPtr(), <char*>volatileByteString, size)
@@ -730,7 +738,7 @@ cdef class PHashTable(AssignedByReference):
         cdef unsigned long hashTableSize = (actualSize *
                                             self.hashEntryClass.assignmentSize)
         self.getP2IS().o2EntryTable = self.allocate(hashTableSize)
-        memset(self.offset2Address(self.getP2IS().o2EntryTable),
+        memset(self.trx.offset2Address(self.getP2IS().o2EntryTable),
                0, hashTableSize)
         LOG.debug("Created new HashTable  {4} of type '{0}', "
                   "requested_size={1} actual size={2} allowed capacity={3}."
@@ -939,7 +947,7 @@ cdef class PList(AssignedByReference):
         o2NewEntry[0] = self.allocate(
             sizeof(CListEntry)  + valueClass.assignmentSize)
         cdef CListEntry *p2NewEntry = (
-                           <CListEntry *>self.offset2Address(o2NewEntry[0]))
+                           <CListEntry *>self.trx.offset2Address(o2NewEntry[0]))
         valueClass.assign((<void*>p2NewEntry) +
                           (<ListMeta>(self.ptype)).o2Value,
                           value
@@ -966,7 +974,7 @@ cdef class PList(AssignedByReference):
             # Caveat!
             # http://stackoverflow.com/questions/11498441/what-is-this-kind-of-assignment-in-python-called-a-b-true
             p2LastEntry =  (
-                <CListEntry *>self.offset2Address(self.getP2IS().o2LastEntry))
+                <CListEntry *>self.trx.offset2Address(self.getP2IS().o2LastEntry))
             p2LastEntry.o2NextEntry = o2NewEntry
         self.getP2IS().o2LastEntry = o2NewEntry
 
@@ -976,7 +984,7 @@ cdef class PList(AssignedByReference):
             CListEntry   *p2Entry
             PersistentMeta valueClass = (<ListMeta>(self.ptype)).valueClass
         while o2Entry:
-            p2Entry = <CListEntry *>(self.offset2Address(o2Entry))
+            p2Entry = <CListEntry *>(self.trx.offset2Address(o2Entry))
             # LOG.info(p2Entry.o2 Value)
             yield valueClass.resolveAndCreateProxyFA(p2Entry + 1)
             o2Entry = p2Entry.o2NextEntry
@@ -1356,91 +1364,10 @@ cdef class PField(object):
 
 cdef class Storage(object):
 
-    cdef registerType(self, PersistentMeta ptype):
-        if hasattr(self.schema, ptype.__name__):
-            raise Exception(
-                "Redefinition of type '{ptype.__name__}'.".format(ptype=ptype))
-        setattr(self.schema, ptype.__name__, ptype)
-        self.typeList.append(ptype)
-
-    def _initialize(self):
-        LOG.info("Initializing new file '{self.fileName}'".format(self=self))
-        assert len(ptypesMagic) < lengthOfMagic
-        cdef int i, j
-        for i in range(numMetadata):
-            self.p2FileHeader = self.p2FileHeaders[i] = \
-                <CStorageHeader*>self.baseAddress + i
-
-            for j in range(len(ptypesMagic)):
-                self.p2FileHeader.magic[j] = ptypesMagic[j]
-
-            self.p2FileHeader.status = 'C'
-            self.p2FileHeader.revision = i
-            self.p2FileHeader.freeOffset = numMetadata*pagesize
-
-        self.p2FileHeader.status = 'D'
-        self.p2LoHeader = self.p2FileHeaders[0]
-        self.p2HiHeader = self.p2FileHeaders[1]
-
-    def _mount(self):
-        LOG.info("Mounting existing file '{self.fileName}'".format(self=self))
-        self.p2HiHeader = self.p2LoHeader = NULL
-        cdef int i
-        for i in range(numMetadata):
-            self.p2FileHeader = self.p2FileHeaders[i] = \
-                <CStorageHeader*>self.baseAddress + i
-            if any(self.p2FileHeader.magic[j] != ptypesMagic[j]
-                   for j in range(len(ptypesMagic))
-                   ):
-                raise Exception('File {self.fileName} is incompatible with '
-                                'this version of ptypes!'.format(
-                                    self=self)
-                                )
-            if (self.p2LoHeader == NULL or
-                    self.p2LoHeader.revision > self.p2FileHeader.revision):
-
-                self.p2LoHeader = self.p2FileHeader
-
-            if (self.p2HiHeader == NULL or
-                    self.p2HiHeader.revision < self.p2FileHeader.revision):
-
-                self.p2HiHeader = self.p2FileHeader
-
-        if self.p2HiHeader.status != 'C':  # roll back
-            LOG.info(
-                "Latest shutdown was incomplete, restoring previous metadata.")
-            self.p2FileHeader = self.p2HiHeader
-            self.p2FileHeader[0] = self.p2LoHeader[0]
-            if self.p2HiHeader.status != 'C':
-                raise Exception("No clean metadata could be found!")
-        else:
-            LOG.debug("Latest shutdown was clean, using latest metadata.")
-            self.p2FileHeader = self.p2LoHeader
-            self.p2FileHeader[0] = self.p2HiHeader[0]
-        self.p2FileHeader.status = 'D'
-        self.p2FileHeader.revision += 1
-
     def __init__(self, fileName, unsigned long fileSize=0,
                  unsigned long stringRegistrySize=0
                  ):
-        cdef unsigned long numPages = (
-            0 if fileSize==0 else (fileSize-1)/pagesize + 1 + numMetadata
-        )
-        MemoryMappedFile.__init__(self, fileName, numPages)
-        self.region = CProtectedRegion_new(self.baseAddress, self.realFileSize)
-        CProtectedRegion_setCurrent(self.region)
-
-        LOG.debug("Highest metadata revision is {0}"
-                  .format(self.p2HiHeader.revision))
-        LOG.debug("Lowest metadata revision is {0}"
-                  .format(self.p2LoHeader.revision))
-        LOG.debug("Using metadata revision {0}"
-                  .format(self.p2FileHeader.revision))
-        if not self.isNew and fileSize > self.realFileSize:
-            raise Exception("File {self.fileName} is of size "
-                            "{self.realFileSize}, cannot resize it to "
-                            "{fileSize}.".format(self=self, fileSize=fileSize)
-                            )
+        self.backingFile = BackingFile(fileName, fileSize)
         self.stringRegistrySize = stringRegistrySize
         self.schema = ModuleType('schema')
         self.typeList = list()
@@ -1448,92 +1375,144 @@ cdef class Storage(object):
         self.define(Int)
         self.define(Float)
         self.define(__ByteString('ByteString'))
-        ByteString = self.schema.ByteString
-        cdef:
-            PersistentMeta ListOfByteStrings = \
-                self.define(List('__ListOfByteStrings')[ByteString])
-            PersistentMeta SetOfByteStrings  = \
-                self.define(Set('__SetOfByteStrings')[ByteString])
+        self.define(List('ListOfByteStrings')[self.schema.ByteString])
+        self.define(Set('SetOfByteStrings')[self.schema.ByteString])
+        self.trx = None
+        self.setTrx(Trx(self.backingFile))
 
-        if self.p2FileHeader.o2ByteStringRegistry:
+    cpdef Trx setTrx(self, Trx trx):
+        cdef:
+            PersistentMeta Root
+            Trx oldTrx = self.trx
+
+        if trx is None:
+            raise ValueError('need a valid Trx object, not None')
+        trx.assertNotClosed()
+        self.trx = trx
+        self.p2StorageHeader = self.trx.region.baseAddress
+
+        if self.p2StorageHeader.o2ByteStringRegistry:
             LOG.debug("Using the existing stringRegistry")
-            self.stringRegistry = SetOfByteStrings.createProxy(
-                self.p2FileHeader.o2ByteStringRegistry)
+            self.stringRegistry = \
+                ((<PersistentMeta?>self.schema.SetOfByteStrings)
+                    .createProxy(self.p2StorageHeader.o2ByteStringRegistry))
         else:
             LOG.debug("Creating a new stringRegistry")
-            self.stringRegistry = SetOfByteStrings(self.stringRegistrySize)
-            self.p2FileHeader.o2ByteStringRegistry = self.stringRegistry.offset
-        LOG.debug('self.p2FileHeader.o2ByteStringRegistry: {0}'.format(
-            hex(self.p2FileHeader.o2ByteStringRegistry)))
+            self.stringRegistry = self.schema.SetOfByteStrings(self.stringRegistrySize)
+            self.p2StorageHeader.o2ByteStringRegistry = self.stringRegistry.offset
+        LOG.debug('self.p2StorageHeader.o2ByteStringRegistry: {0}'.format(
+            hex(self.p2StorageHeader.o2ByteStringRegistry)))
 
-        self.createTypes = (self.p2FileHeader.o2PickledTypeList == 0)
-        if self.createTypes:
-            LOG.debug("Creating a new schema")
-            self.pickledTypeList = <PList>ListOfByteStrings()
-            self.p2FileHeader.o2PickledTypeList = self.pickledTypeList.offset
-            try:
-                threadLocal.currentStorage = self
-                StructureMeta('Structure', (PStructure,), dict())
-                self.populateSchema()
-            finally:
-                threadLocal.currentStorage = None
+        if self.p2StorageHeader.o2PickledTypeList:
+            self.loadSchema()
         else:
-            LOG.debug("Loading the previously saved schema")
+            self.createSchema()
+        try:
+            Root = self.schema.Root
+        except AttributeError:
+            raise Exception(
+                "The schema contains no type called 'Root'.")
+        LOG.debug('self.p2StorageHeader.o2Root #1: {0}'.format(
+            hex(self.p2StorageHeader.o2Root)))
+        if self.p2StorageHeader.o2Root:
+            self.__root = Root.createProxy(self.p2StorageHeader.o2Root)
+        else:
+            self.__root = Root()
+            self.p2StorageHeader.o2Root = self.__root.offset
+        LOG.debug('self.p2StorageHeader.o2Root #2: {0}'.format(
+            hex(self.p2StorageHeader.o2Root)))
+        return oldTrx
 
-            self.pickledTypeList = <PList>(ListOfByteStrings.
-                                           createProxy(self.p2FileHeader
-                                                       .o2PickledTypeList))
+    def createSchema(self):
+        LOG.debug("Creating a new schema")
+        cdef PList pickledTypeList = <PList?>self.schema.ListOfByteStrings()
 
-            for s in self.pickledTypeList:
-                t = pickle.loads(s.contents)
-                if t[0] == '_typedef':
-                    className, meta, proxyClass = t[1:4]
-                    typeParams = [
-                        getattr(self.schema, typeParam[1])
-                        if (isinstance(typeParam, tuple) and
-                            typeParam[0] == 'PersistentMeta')
-                        else typeParam
-                        for typeParam in t[4:]
-                    ]
-                    meta._typedef(self, className, proxyClass, *typeParams)
-                elif t[0] == 'StructureMeta':
-                    className, bases, attributeDict = t[1:4]
-                    base2  = list()
-                    for base in bases:
-                        baseKind, baseX = base
-                        if baseKind == 'persistentBase':
-                            base = getattr(self.schema, baseX)
-                        else:
-                            assert baseKind == 'volatileBase', baseKind
-                            base = baseX
-                        base2.append(base)
-                    for fieldName, fieldTypeName in t[4]:
-                        attributeDict[fieldName] = getattr(
-                            self.schema, fieldTypeName)
-                    try:
-                        threadLocal.currentStorage = self
-                        StructureMeta(className, tuple(base2), attributeDict)
-                    finally:
-                        threadLocal.currentStorage = None
-                else:
-                    assert False
+        self.p2StorageHeader.o2PickledTypeList = pickledTypeList.offset
+        try:
+            threadLocal.currentStorage = self
+            StructureMeta('Structure', (PStructure,), dict())
+            self.populateSchema()
+        finally:
+            threadLocal.currentStorage = None
+
+        for ptype in self.typeList:
+            if ptype.__name__ not in ('ByteString', 'Int', 'Float', 
+                                      'SetOfByteStrings', 'ListOfByteStrings'):
+                x = ptype.reduce()
+#                             LOG.debug( 'pickle data:'+ repr(x))
+                s = self.stringRegistry.get(pickle.dumps(x))
+                pickledTypeList.append(s)
                 del s  # do not leave a dangling proxy around
+        LOG.debug("Saved the new schema.")
 
-    def __flush(self):
-        self.assertNotClosed()
-        MemoryMappedFile.flush(self)
-        self.p2FileHeader.status = 'C'
-        MemoryMappedFile.flush(self)
+    def loadSchema(self):
+        LOG.debug("Loading the previously saved schema")
 
-    cpdef flush(self, bint async=False):
-        LOG.debug("Flushing {}".format(self))
-        self.__flush()
-        cdef CStorageHeader *p2FileHeader = self.p2FileHeader
-        cdef unsigned long revision = p2FileHeader.revision + 1
-        self.p2FileHeader = self.p2FileHeaders[revision % numMetadata]
-        self.p2FileHeader[0] = p2FileHeader[0]
-        self.p2FileHeader.revision = revision
-        self.p2FileHeader.status = 'D'
+        cdef PList pickledTypeList = \
+            <PList>((<PersistentMeta?>self.schema.ListOfByteStrings)
+                        .createProxy(self.trx, 
+                                     self.p2StorageHeader.o2PickledTypeList))
+
+        for s in pickledTypeList:
+            t = pickle.loads(s.contents)
+            if t[0] == '_typedef':
+                className, meta, proxyClass = t[1:4]
+                typeParams = [
+                    getattr(self.schema, typeParam[1])
+                    if (isinstance(typeParam, tuple) and
+                        typeParam[0] == 'PersistentMeta')
+                    else typeParam
+                    for typeParam in t[4:]
+                ]
+                ptype = meta._typedef(self, className, proxyClass, *typeParams)
+            elif t[0] == 'StructureMeta':
+                className, bases, attributeDict = t[1:4]
+                base2  = list()
+                for base in bases:
+                    baseKind, baseX = base
+                    if baseKind == 'persistentBase':
+                        base = getattr(self.schema, baseX)
+                    else:
+                        assert baseKind == 'volatileBase', baseKind
+                        base = baseX
+                    base2.append(base)
+                for fieldName, fieldTypeName in t[4]:
+                    attributeDict[fieldName] = getattr(
+                        self.schema, fieldTypeName)
+                try:
+                    threadLocal.currentStorage = self
+                    ptype = StructureMeta(className, tuple(base2), attributeDict)
+                finally:
+                    threadLocal.currentStorage = None
+            else:
+                assert False
+            self.typeList.append(ptype)
+            del s  # do not leave a dangling proxy around
+
+    cdef Offset allocate(self, int size) except 0:
+        self.trx.assertNotClosed()
+        cdef:
+            Offset origFreeOffset = self.p2StorageHeader.freeOffset
+            Offset newFreeOffset = self.p2StorageHeader.freeOffset + size
+        if newFreeOffset > self.backingFile.realFileSize:
+            raise DbFullException("{self.fileName} is full.".format(self=self))
+        self.p2StorageHeader.freeOffset = newFreeOffset
+#         LOG.debug( "allocated: {origFreeOffset}, {size},
+#               {newFreeOffset}".format(**locals()))
+        return origFreeOffset
+
+    property root:
+        def __get__(self):
+            self.trx.assertNotClosed()
+            return self.__root
+
+    def commit(self):
+        self.trx.close(doCommit=True)
+        self.setTrx(Trx(self.backingFile))
+
+    def rollback(self):
+        self.trx.close(doCommit=False)
+        self.setTrx(Trx(self.backingFile))
 
     cpdef close(self):
         """ Flush and close the storage.
@@ -1541,77 +1520,15 @@ cdef class Storage(object):
             Triggers a garbage collection to break any unreachable cycles
             referencing the storage.
         """
-        LOG.debug("Closing {}".format(self))
-        self.assertNotClosed()
-        suspects = [o for o in gc.get_referrers(self)
-                    if (isinstance(o, Persistent) and
-                        o not in [self.__root, self.stringRegistry,
-                                  self.pickledTypeList]
-                        )
-                    ]
-        if suspects:
-            LOG.warning('The following proxy objects are probably part of a '
-                        'reference cycle: \n{}' .format(suspects)
-                        )
-        gc.collect()
-        suspects = [o for o in gc.get_referrers(self)
-                    if (isinstance(o, Persistent) and
-                        o not in [self.__root, self.stringRegistry,
-                                  self.pickledTypeList]
-                        )
-                    ]
-        if suspects:
-            raise ValueError("Cannot close {} - some proxies are still around:"
-                             " {}".format(
-                                 self, ' '.join([repr(s) for s in suspects]))
-                             )
-        self.__flush()
-        MemoryMappedFile.close(self)
+        self.trx.close(doCommit=False)
+        BackingFile.close(self)
 
-    cdef Offset allocate(self, int size) except 0:
-        self.assertNotClosed()
-        cdef:
-            Offset origFreeOffset = self.p2FileHeader.freeOffset
-            Offset newFreeOffset = self.p2FileHeader.freeOffset + size
-        if newFreeOffset > self.realFileSize:
-            raise DbFullException("{self.fileName} is full.".format(self=self))
-        self.p2FileHeader.freeOffset = newFreeOffset
-#         LOG.debug( "allocated: {origFreeOffset}, {size},
-#               {newFreeOffset}".format(**locals()))
-        return origFreeOffset
-
-    property root:
-        def __get__(self):
-            cdef PersistentMeta Root
-            self.assertNotClosed()
-            if self.__root is None:
-                LOG.debug(
-                    'self.createTypes: {self.createTypes}'.format(self=self))
-                if self.createTypes:
-                    for ptype in self.typeList:
-                        if ptype.__name__ not in ('ByteString', 'Int',
-                                                  'Float', ):
-                            x = ptype.reduce()
-#                             LOG.debug( 'pickle data:'+ repr(x))
-                            s = self.stringRegistry.get(pickle.dumps(x))
-                            self.pickledTypeList.append(s)
-                            del s  # do not leave a dangling proxy around
-                    LOG.debug("Saved the new schema.")
-                try:
-                    Root = self.schema.Root
-                except AttributeError:
-                    raise Exception(
-                        "The schema contains no type called 'Root'.")
-                LOG.debug('self.p2FileHeader.o2Root #1: {0}'.format(
-                    hex(self.p2FileHeader.o2Root)))
-                if self.p2FileHeader.o2Root:
-                    self.__root = Root.createProxy(self.p2FileHeader.o2Root)
-                else:
-                    self.__root = Root()
-                    self.p2FileHeader.o2Root = self.__root.offset
-                LOG.debug('self.p2FileHeader.o2Root #2: {0}'.format(
-                    hex(self.p2FileHeader.o2Root)))
-            return self.__root
+    cdef registerType(self, PersistentMeta ptype):
+        if hasattr(self.schema, ptype.__name__):
+            raise Exception(
+                "Redefinition of type '{ptype.__name__}'.".format(ptype=ptype))
+        setattr(self.schema, ptype.__name__, ptype)
+        self.typeList.append(ptype)
 
     def defineType(Storage storage, TypeDescriptor typeDescriptor):
         cdef:

@@ -119,7 +119,7 @@ cdef class PBuffer(AssignedByReference):
         # save/copy the buffer into the persistent store
         if view.buf is not NULL:
             cBuffer.o2buf = self.allocate(view.len)
-            PyBuffer_ToContiguous(self.offset2Address(cBuffer.o2buf),
+            PyBuffer_ToContiguous(self.trx.offset2Address(cBuffer.o2buf),
                                   &view, view.len, 'C')
 
             PyBuffer_FillContiguousStrides(view.ndim, view.shape, view.strides,
@@ -159,7 +159,7 @@ cdef class PBuffer(AssignedByReference):
         if source==NULL:
             return 0
         cdef Offset targetOffset = self.allocate(length)
-        memcpy(self.offset2Address(targetOffset), source, length)
+        memcpy(self.trx.offset2Address(targetOffset), source, length)
         return targetOffset
 
     def __getbuffer__(self, Py_buffer* view, int flags):
@@ -183,7 +183,7 @@ cdef class PBuffer(AssignedByReference):
 
         if flags & PyBUF_FORMAT:
             assert cBuffer.o2format != 0
-            view.format = <char*> self.offset2Address(cBuffer.o2format)
+            view.format = <char*> self.trx.offset2Address(cBuffer.o2format)
         else:
             view.format = NULL
 
@@ -193,10 +193,10 @@ cdef class PBuffer(AssignedByReference):
         view.len = cBuffer.len
         view.ndim = cBuffer.ndim
         view.itemsize = cBuffer.itemsize
-        view.buf = self.offset2Address(cBuffer.o2buf)
-        view.shape   = <Py_ssize_t*> self.offset2Address(cBuffer.o2shape)
+        view.buf = self.trx.offset2Address(cBuffer.o2buf)
+        view.shape   = <Py_ssize_t*> self.trx.offset2Address(cBuffer.o2shape)
         view.strides = \
-            <Py_ssize_t*> self.offset2Address(cBuffer.o2strides)
+            <Py_ssize_t*> self.trx.offset2Address(cBuffer.o2strides)
         view.suboffsets = NULL
         view.internal = NULL
         view.obj = self

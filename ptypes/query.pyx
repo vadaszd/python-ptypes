@@ -636,7 +636,6 @@ class QueryMeta(type):
         if GroupBy:
             output2 = attribute_dict['output2']  # output storage
             # we only support blank storages for now
-            assert output2.createTypes
             attributes = dict(__metaclass__=StructureMeta,
                               storage=output2
                               )
