@@ -1,3 +1,16 @@
+cdef extern from "avl-tree.h" nogil:
+
+    ctypedef struct AVLTree:
+        pass
+
+
+from libc.stdlib cimport abort
+
+cdef enum:
+    lengthOfMagic = 31
+    numMetadata = 2
+
+ctypedef unsigned long Offset
 
 
 cdef struct CBackingFileHeader:
@@ -14,30 +27,56 @@ cdef class BackingFile(object):
         long            fd
         bint            isNew
         size_t          numPages, realFileSize
+        Offset          o2payloadArea
+        AdminMapping    adminMapping
 
+#     cpdef flush(self, bint async=?)
+    cpdef close(self)
+
+
+cdef struct CRegion:
+    void   *baseAddress   # address of 1st byte included
+    void   *endAddress    # address of 1st byte excluded
+    size_t  length        # end-base
+    long    fd            # file descriptor of the underlying file
+    Offset  o2Base
+    AVLTree *dirtyPages
+
+
+cdef class FileMapping(object):
+    cdef:
+        BackingFile         backingFile
+        CRegion             region          # covers the whole file
+        CRegion             adminRegion     # covers the admin area (header)
+        CRegion             payloadRegion   # covers the payload area
+
+        str __formatErrorMessage(self, CRegion *region, str message, 
+                                 int error=?, fileName=?)
+        map(self, CRegion *region, )
+#         flush(CRegion* region, bint async=0)
+
+
+cdef class AdminMapping(FileMapping):
+    cdef:
         CBackingFileHeader       *p2FileHeaders[numMetadata]
         CBackingFileHeader       *p2HiHeader
         CBackingFileHeader       *p2LoHeader
         CBackingFileHeader       *p2FileHeader
 
-    cpdef flush(self, bint async=?)
-    cpdef close(self)
+        protect(self, CRegion *region, int protectionMode)
+        flush(self, CRegion *region, bint async=?)
+        initialize(self)
+        mount(self)
+        sync(self, Trx trx, bint doFlush=?)
 
 
-cdef struct CProtectedRegion:
-    void *baseAddress   # address of 1st byte included
-    void *endAddress    # address of 1st byte excluded
-    size_t length       # end-base
-
-
-cdef class Trx(object):
+cdef class Trx(FileMapping):
     """ An atomically updateable memory region mapped into a file
     """
     cdef:
-        BackingFile         backingFile
-        CProtectedRegion    *region
-
         Trx close(Trx self, type Persistent, bint doCommit)
+        updatePayload(self, void *targetRegionBaseAddress)
+
 
     cdef inline assertNotClosed(self):
         if self.region.baseAddress == NULL:
@@ -54,7 +93,7 @@ cdef class Trx(object):
             abort()
         return self.region.baseAddress + offset
 
-    cdef inline Offset address2Offset(PersistentMeta ptype, 
+    cdef inline Offset address2Offset(self, 
                                       const void* address) except 0:
         assert address > self.region.baseAddress
         cdef Offset offset = address - self.region.baseAddress
@@ -62,7 +101,4 @@ cdef class Trx(object):
         return offset
 
 
-
-DEF lengthOfMagic = 31
-DEF numMetadata = 2
 

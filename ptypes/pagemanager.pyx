@@ -1,11 +1,13 @@
+from Cython.Shadow import NULL
 
 
-cdef extern from "sys/mman.h":
+cdef extern from "sys/mman.h" nogil:
     void *mmap(void *addr, size_t length, int prot, int flags, int fd,
                int offset)
     int munmap(void *addr, size_t length)
     int mprotect(void *addr, size_t len, int prot)
-    int PROT_READ, PROT_WRITE, PROT_NONE
+    int msync(void *addr, size_t length, int flags)
+    int PROT_READ, PROT_WRITE, PROT_NONE, MS_ASYNC, MS_SYNC
     int MAP_SHARED, MAP_PRIVATE  # flags
     void *MAP_FAILED
 
@@ -16,12 +18,57 @@ cdef extern from "signal.h" nogil:
 cdef extern from "unistd.h" nogil:
     int getpagesize()
 
+
+cdef extern from "avl-tree.h" nogil:
+ 
+    ctypedef struct AVLTree:
+        pass
+ 
+    ctypedef struct AVLTreeNode:
+        pass
+ 
+    ctypedef struct AVLTreeKey:
+        pass
+ 
+    ctypedef struct AVLTreeValue:
+        pass
+ 
+    ctypedef enum AVLTreeNodeMatchType:
+        AVL_TREE_NODE_EQUAL
+        AVL_TREE_NODE_SMALLER
+        AVL_TREE_NODE_GREATER
+
+    ctypedef int (*AVLTreeCompareFunc)(AVLTreeValue value1, 
+                                       AVLTreeValue value2)
+
+    ctypedef int (*AVLTreeEnumCallBackFunc)(void* context, AVLTreeNode *node)
+
+#     int AVL_TREE_NODE_SMALLER
+ 
+    AVLTree     *avl_tree_new(AVLTreeCompareFunc compare_func)
+    void         avl_tree_free(AVLTree *tree)
+
+    AVLTreeNode *avl_tree_insert(AVLTree *tree, AVLTreeKey key,
+                                 AVLTreeValue value)
+
+    int          avl_tree_remove(AVLTree *tree, AVLTreeKey key)
+
+    AVLTreeNode *avl_tree_lookup_nearest_node(AVLTree *tree, AVLTreeKey key,
+                                              AVLTreeNodeMatchType match_type)
+
+    AVLTreeValue avl_tree_node_value(AVLTreeNode *node)
+    AVLTreeKey   avl_tree_node_key(AVLTreeNode *node)
+
+    int          avl_tree_apply(AVLTree *tree,
+                                    AVLTreeEnumCallBackFunc callback,
+                                    void* context)
+
 from posix.signal cimport sigaction_t, siginfo_t
 from posix.signal cimport sigaction, sigemptyset, SA_SIGINFO
 from libc.stdio cimport perror
 from libc.errno cimport errno
 from libc.stdlib cimport malloc, free
-from libc.string import strerror, memcpy
+from libc.string cimport strerror, memcpy
 
 cdef char *ptypesMagic     = "ptypes-0.6.0"       # Maintained by bumpbersion,
 cdef char *ptypesRedoMagic = "redo-ptypes-0.6.0"  # no manual changes please!
@@ -35,7 +82,11 @@ cdef extern from "errno.h":
 
 
 import os
+import logging
+from os import SEEK_SET, O_CREAT, O_RDWR
+import gc
 
+LOG = logging.getLogger(__name__)
 
 cdef class BackingFile(object):
 
@@ -47,9 +98,9 @@ cdef class BackingFile(object):
             self.numPages = (0 if fileSize==0 else 
                              (fileSize-1)/pagesize + 1 + numMetadata)
             LOG.debug("Creating new file '{self.fileName}'".format(self=self))
-            assert numPages > 0, ('The database cannot have {numPages} pages.'
-                                  .format(numPages=self.numPages)
-                                  )
+            assert self.numPages > 0, ('The database cannot have {numPages} '
+                                       'pages.'.format(numPages=self.numPages)
+                                       )
             self.isNew = 1
             self.realFileSize = self.numPages * pagesize
             self.fd = os.open(self.fileName, O_CREAT | O_RDWR)
@@ -61,49 +112,172 @@ cdef class BackingFile(object):
             self.isNew = 0
             self.realFileSize = os.fstat(self.fd).st_size
             self.numPages = int(self.realFileSize / pagesize)
-        cdef int error=0
-#         self.region = CProtectedRegion_new(xxx) xxx xxx
+        self.o2payloadArea = pagesize * numMetadata
+
+        self.adminMapping = AdminMapping(self)
+        self.adminMapping.protect(&self.adminMapping.payloadRegion, PROT_NONE)
         if self.isNew:
-            self._initialize()
+            self.adminMapping.protect(&self.adminMapping.adminRegion, 
+                                      PROT_READ|PROT_WRITE)
+            self.adminMapping.initialize()
         else:
-            self._mount()
+            self.adminMapping.protect(&self.adminMapping.adminRegion, PROT_READ)
+            self.adminMapping.mount()
+        self.adminMapping.protect(&self.adminMapping.adminRegion, PROT_NONE)
+
         LOG.debug("Highest metadata revision is {0}"
-                  .format(self.p2HiHeader.revision))
+                  .format(self.adminMapping.p2HiHeader.revision))
         LOG.debug("Lowest metadata revision is {0}"
-                  .format(self.p2LoHeader.revision))
+                  .format(self.adminMapping.p2LoHeader.revision))
         LOG.debug("Using metadata revision {0}"
-                  .format(self.p2FileHeader.revision))
+                  .format(self.adminMapping.p2FileHeader.revision))
+
         if not self.isNew and fileSize > self.realFileSize:
             raise Exception("File {self.fileName} is of size "
                             "{self.realFileSize}, cannot resize it to "
                             "{fileSize}.".format(self=self, fileSize=fileSize)
                             )
 
-    def _initialize(self):
+    cpdef close(self):
+        self.assertNotClosed()
+        # Need to close the adminMapping first! XXX
+        os.close(self.fd)
+
+    def __repr__(self):
+        return ("<{self.__class__.__name__} '{self.fileName}'>"
+                .format(self=self))
+
+
+cdef CRegion* findRegion(void *address ) nogil:
+    cdef AVLTreeNode *tree_node = \
+        avl_tree_lookup_nearest_node(regions, <AVLTreeKey>address, 
+                                     AVL_TREE_NODE_SMALLER)
+    if tree_node == NULL:
+        return NULL
+
+    cdef CRegion* region = <CRegion*>avl_tree_node_value(tree_node)
+    if address < region.endAddress:
+        return region
+
+    return NULL
+
+
+cdef int compareAddresses(AVLTreeValue value1, AVLTreeValue value2) nogil:
+    if <size_t>value1 > <size_t>value2:
+        return 1
+    elif <size_t>value1 == <size_t>value2:
+        return 0
+    else:
+        return -1 
+
+
+cdef class FileMapping(object):
+
+    cdef map(self, CRegion *region, ):
+        region.baseAddress = mmap(NULL, self.region.length, 
+                                  PROT_READ, MAP_SHARED, 
+                                  region.fd, region.o2Base)
+        if region.baseAddress == MAP_FAILED:
+            #error = errno  # save it, any c-lib call may overwrite it!
+            raise RuntimeError(
+                self.__formatErrorMessage(region,
+                                    'Could not map {fileName}: {error}',
+                                    errno,
+                                    fileName=self.backingFile.fileName)
+                                    )
+        region.endAddress = region.baseAddress + region.length
+
+        LOG.debug( self.__formatErrorMessage(region, 
+                'Mmapped {fileName} memory region {baseAddress}-{length}',
+                self.backingFile.fileName))
+
+    def __cinit__(self, BackingFile backingFile):
+        self.backingFile = backingFile
+
+        self.region.fd = self.adminRegion.fd = \
+                self.payloadRegion.fd = backingFile.fd
+
+        # Whole file
+        self.region.o2Base = 0
+        self.region.length = backingFile.realFileSize
+        self.map(&self.region)
+
+        # Admin region 
+        self.adminRegion.o2Base = 0
+        self.adminRegion.length = backingFile.o2payloadArea
+        self.adminRegion.baseAddress = self.region.baseAddress
+
+        self.adminRegion.endAddress = \
+                self.region.baseAddress + self.adminRegion.length
+
+        # Payload region 
+        self.payloadRegion.o2Base = self.adminRegion.length
+
+        self.payloadRegion.length = \
+                self.region.length - self.adminRegion.length
+
+        self.payloadRegion.baseAddress = self.adminRegion.endAddress
+        self.payloadRegion.endAddress = self.region.endAddress
+
+    def __dealloc__(self):
+        if self.region.baseAddress != NULL:
+            LOG.debug(self.__formatErrorMessage(&self.region,
+                            'Unmapping memory region {baseAddress}-{length}'))
+            if munmap(self.region.baseAddress, self.region.length):
+                raise RuntimeError(self.__formatErrorMessage(&self.region, 
+                    'Could not unmap {baseAddress}-{length}: {error}', errno))
+            self.region.baseAddress = self.adminRegion.baseAddress = \
+                    self.payloadRegion.baseAddress = NULL
+
+    cdef str __formatErrorMessage(self, CRegion *region, str message, 
+                                  int error=0, fileName=None):
+        return message.format(
+                    baseAddress=hex(<unsigned long>region.baseAddress),
+                    length=hex(region.length),
+                    error=strerror(error) if error else "",
+                    fileName=fileName)
+
+
+# cdef class AdminMapping(FileMapping):
+cdef class AdminMapping(FileMapping):
+
+    cdef protect(self, CRegion *region, int protectionMode):
+        if mprotect(region.baseAddress, region.length, protectionMode):
+            raise RuntimeError(self.__formatErrorMessage(region,
+                "Could not protect the memory mapped region "
+                "{baseAddress}-{length}: {error}", errno))
+
+    cdef flush(self, CRegion *region, bint async=0):
+        LOG.debug(self.__formatErrorMessage(region,
+                        'Msyncing memory region {baseAddress}-{length}'))
+        if msync(region.baseAddress, region.length,
+                 MS_ASYNC if async else MS_SYNC):
+            raise RuntimeError(self.__formatErrorMessage(region,
+                'Could not sync {baseAddress}-{length}: {error}', errno))
+
+    cdef initialize(self):
         LOG.info("Initializing new file '{self.fileName}'".format(self=self))
         assert len(ptypesMagic) < lengthOfMagic
-        cdef int i
 
+        cdef int i
         for i in range(numMetadata):
             self.p2FileHeader = self.p2FileHeaders[i] = \
-                            <CStorageHeader*>self.baseAddress + i*pagesize
+                    <CBackingFileHeader*>(self.region.baseAddress + i*pagesize)
             memcpy(self.p2FileHeader.magic, ptypesMagic, len(ptypesMagic))
             self.p2FileHeader.status = 'C'
             self.p2FileHeader.revision = i
-            self.p2FileHeader.freeOffset = numMetadata*pagesize
 
-        self.p2FileHeader.status = 'D'
         self.p2LoHeader = self.p2FileHeaders[0]
         self.p2HiHeader = self.p2FileHeaders[1]
 
-    def _mount(self):
+    cdef mount(self):
         LOG.info("Mounting existing file '{self.fileName}'".format(self=self))
         self.p2HiHeader = self.p2LoHeader = NULL
 
         cdef int i
         for i in range(numMetadata):
             self.p2FileHeader = self.p2FileHeaders[i] = \
-                <CStorageHeader*>self.baseAddress + i*pagesize
+                <CBackingFileHeader*>(self.region.baseAddress + i*pagesize)
             if any(self.p2FileHeader.magic[j] != ptypesMagic[j]
                    for j in range(len(ptypesMagic))
                    ):
@@ -118,136 +292,65 @@ cdef class BackingFile(object):
                     self.p2HiHeader.revision < self.p2FileHeader.revision):
                 self.p2HiHeader = self.p2FileHeader
 
-        if self.p2HiHeader.status != 'C':  # roll back
+        if self.p2HiHeader.status == 'C':  # roll back
+            LOG.debug("Latest shutdown was clean, using latest metadata.")
+            self.p2FileHeader = self.p2LoHeader
+            self.p2FileHeader[0] = self.p2HiHeader[0]
+        else:
             LOG.info(
                 "Latest shutdown was incomplete, restoring previous metadata.")
             self.p2FileHeader = self.p2HiHeader
             self.p2FileHeader[0] = self.p2LoHeader[0]
             if self.p2HiHeader.status != 'C':
                 raise Exception("No clean metadata could be found!")
-        else:
-            LOG.debug("Latest shutdown was clean, using latest metadata.")
-            self.p2FileHeader = self.p2LoHeader
-            self.p2FileHeader[0] = self.p2HiHeader[0]
 
-        self.p2FileHeader.status = 'D'
-        self.p2FileHeader.revision += 1
+    cdef sync(self, Trx trx, bint doFlush=False):
+        cdef:
+            CBackingFileHeader *p2OriginalFileHeader = self.p2FileHeader
+        if doFlush:
+            self.protect(&self.adminRegion, PROT_READ|PROT_WRITE)
+            self.p2FileHeader = self.p2FileHeaders[ 
+                               p2OriginalFileHeader.revision % numMetadata]
+            self.p2FileHeader[0] = p2OriginalFileHeader[0]  # copy the header
+            self.p2FileHeader.status = 'D'
+            self.p2FileHeader.revision += 1
+            # self.p2FileHeader.lastAppliedRedoFileNumber
+            # self.p2FileHeader.o2lastAppliedTrx
+            self.protect(&self.adminRegion, PROT_NONE)
 
-    def __flush(self):
-        self.assertNotClosed()
-        BackingFile.flush(self)
-        self.p2FileHeader.status = 'C'
-        BackingFile.flush(self)
+        self.protect(&self.payloadRegion, PROT_READ|PROT_WRITE)
+        trx.updatePayload(self.region.baseAddress)
+        self.protect(&self.payloadRegion, PROT_NONE)
 
-    cpdef flush(self, bint async=False):
-        LOG.debug("Flushing {}".format(self))
-        self.__flush()
-        cdef CStorageHeader *p2FileHeader = self.p2FileHeader
-        cdef unsigned long revision = p2FileHeader.revision + 1
-        self.p2FileHeader = self.p2FileHeaders[revision % numMetadata]
-        self.p2FileHeader[0] = p2FileHeader[0]
-        self.p2FileHeader.revision = revision
-        self.p2FileHeader.status = 'D'
+        if doFlush:
+            self.flush(&self.payloadRegion)
+            self.protect(&self.adminRegion, PROT_READ|PROT_WRITE)
+            self.p2FileHeader.status = 'C'
+            self.protect(&self.adminRegion, PROT_NONE)
+            self.flush(&self.adminRegion)
 
-    cpdef close(self):
-        self.assertNotClosed()
-        # Need to close the trx first! XXX
-        os.close(self.fd)
-
-    def __repr__(self):
-        return ("<{self.__class__.__name__} '{self.fileName}'>"
-                .format(self=self))
-
-
-cdef str CProtectedRegion__formatErrorMessage(CProtectedRegion* region,
-                                              str message,
-                                              int error=0,
-                                              fileName=None) except NULL:
-    return message.format(
-                    baseAddress=hex(<unsigned long>region.baseAddress),
-                    length=hex(region.length),
-                    error=strerror(error) if error else "",
-                    fileName=fileName))
-
-
-cdef CProtectedRegion* CProtectedRegion_new(BackingFile backingFile
-                                            ) except NULL:
-    cdef CProtectedRegion *region
-    region = <CProtectedRegion *>malloc(sizeof(CProtectedRegion))
-    region.length = backingFile.realFileSize
-    region.baseAddress = mmap(NULL, region.length, 
-                                   PROT_READ, MAP_SHARED, 
-                                   backingFile.fd, 0)
-    if region.baseAddress == MAP_FAILED:
-        #error = errno  # save it, any c-lib call may overwrite it!
-        raise RuntimeError(
-            CProtectedRegion__formatErrorMessage('Could not map '
-                                                 '{fileName}: {error}',
-                                                 errno,
-                                     fileName=backingFile.fileName)
-                                     )
-    region.endAddress = region.baseAddress + region.length
-    LOG.debug( CProtectedRegion__formatErrorMessage(
-            'Mmapped {fileName} memory region {baseAddress}-{length}'))
-    if mprotect(region.baseAddress, region.length, PROT_READ):
-        raise RuntimeError(CProtectedRegion__formatErrorMessage(
-            "Could not protect the memory mapped region "
-            "{baseAddress}-{length}: {error}", errno))
-    return region
-
-
-cdef CProtectedRegion_delete(CProtectedRegion* region) except NULL:
-    LOG.debug(CProtectedRegion__formatErrorMessage(
-                    'Unmapping memory region {baseAddress}-{length}'))
-    if munmap(region.baseAddress, region.length):
-        raise RuntimeError(CProtectedRegion__formatErrorMessage(
-            'Could not unmap {baseAddress}-{length}: {error}', errno))
-    region.baseAddress = NULL
-    free(region)
-
-
-cdef CProtectedRegion_flush(CProtectedRegion* region, bint async=0
-                            ) except NULL:
-    LOG.debug(CProtectedRegion__formatErrorMessage(
-                    'Msyncing memory region {baseAddress}-{length}'))
-    if msync(self.region.baseAddress, self.region.length,
-             MS_ASYNC if async else MS_SYNC):
-        raise RuntimeError(CProtectedRegion__formatErrorMessage(
-            'Could not sync {baseAddress}-{length}: {error}', errno))
-
-
-cdef class Trx(object):
+cdef class Trx(FileMapping):
     """ An atomically updateable memory region mapped into a file
     """
     def __cinit__(self, BackingFile backingFile):
-        self.backingFile = backingFile
-        self.region =CProtectedRegion_new(backingFile)
+        self.payloadRegion.dirtyPages = avl_tree_new(compareAddresses)
+        if NULL == avl_tree_insert(regions, 
+                                   <AVLTreeKey>self.payloadRegion.baseAddress, 
+                                   <AVLTreeValue>self.payloadRegion):
+            raise MemoryError()
+
 
     def __dealloc__(self):
-        global currentRegion
-        if currentRegion == self.region:
-            currentRegion = NULL
-        if self.region != NULL:
-            CProtectedRegion_delete(self.region)
-            self.region = NULL
+        avl_tree_remove(regions, <AVLTreeKey>self.region.baseAddress)
+        avl_tree_free(self.payloadRegion.dirtyPages)
+        self.payloadRegion.dirtyPages = NULL
 
-    def __init__(self, BackingFile backingFile):
-        self.resume()
-
-    cdef Trx resume(Trx self):
-        global currentRegion, currentTrx
-        cdef Trx *oldTrx = currentTrx
-        currentTrx = self
-        currentRegion = self.region
-        return oldTrx
 
     cdef Trx close(Trx self, type Persistent, bint doCommit):
         LOG.debug("Closing {}".format(self))
         self.trx.assertNotClosed()
         suspects = [o for o in gc.get_referrers(self)
-                    if (isinstance(o, Persistent) and
-                        o not in [self.__root, self.stringRegistry]
-                        )
+                    if isinstance(o, Persistent)
                     ]
         if suspects:
             LOG.warning('The following proxy objects are probably part of a '
@@ -255,18 +358,61 @@ cdef class Trx(object):
                         )
         gc.collect()
         suspects = [o for o in gc.get_referrers(self)
-                    if (isinstance(o, Persistent) and
-                        o not in [self.__root, self.stringRegistry]
-                        )
+                    if isinstance(o, Persistent)
                     ]
         if suspects:
             raise ValueError("Cannot close {} - some proxies are still around:"
                              " {}".format(
                                  self, ' '.join([repr(s) for s in suspects]))
                              )
-        self.__flush()
+        self.backingFile.adminMapping.sync(self, doFlush=True)
+
+    cdef updatePayload(self, void *targetRegionBaseAddress):
+        avl_tree_apply(self.payloadRegion.dirtyPages, copyPage, 
+                       targetRegionBaseAddress)
+
+
+cdef int copyPage(void *targetRegionBaseAddress, AVLTreeNode *node) nogil:
+    cdef:
+        Offset offset = <Offset>avl_tree_node_key(node)
+        void *source = <void*>avl_tree_node_value(node)
+        void *destination = targetRegionBaseAddress + offset 
+    memcpy(destination, source, pagesize)
+    return 1
+
+cdef void segv_handler(int sig, siginfo_t *si, void *x ) nogil:
+    cdef:
+        int      error
+        CRegion* payloadRegion
+        void*    pageAddress
+        Offset   pageOffset   # offset of the page within the file 
+
+    if (sig == SIGSEGV and si.si_signo == SIGSEGV and 
+            si.si_code == SEGV_ACCERR ):
+        payloadRegion = findRegion(si.si_addr)
+        if payloadRegion != NULL:
+            pageAddress = <void*>(<size_t>si.si_addr & pageAddressMask)
+#             if mprotect(pageAddress, pagesize, PROT_READ|PROT_WRITE):
+            pageOffset = pageAddress - payloadRegion.baseAddress + \
+                    payloadRegion.o2Base
+            if mmap(pageAddress, pagesize, PROT_READ|PROT_WRITE, MAP_PRIVATE, 
+                                       payloadRegion.fd, pageOffset):
+                error = errno
+                perror("Could not remap the page.")
+            else:
+                if NULL == avl_tree_insert(payloadRegion.dirtyPages, 
+                                           <AVLTreeKey>pageOffset, 
+                                           <AVLTreeValue>pageAddress):
+                    perror("Cannot insert the touched memory page into the "
+                           "dirty list: out of memory.")
+                else:
+                    return
+    sigaction(SIGSEGV, &originalSigSegAction, NULL)
+
 
 cdef initPageManager():
+    regions = avl_tree_new(compareAddresses)
+
     cdef sigaction_t action
     action.sa_sigaction = segv_handler
 
@@ -280,30 +426,13 @@ cdef initPageManager():
                            "segmentation faults.")
 
 
-cdef void segv_handler(int sig, siginfo_t *si, void *x ) nogil:
-    cdef int error
-    if (sig != SIGSEGV or si.si_signo != SIGSEGV or 
-            si.si_code != SEGV_ACCERR or currentRegion == NULL or
-            si.si_addr < currentRegion.baseAddress or
-            si.si_addr >= currentRegion.endAddress):
-        sigaction(SIGSEGV, &originalSigSegAction, NULL)
-        return
-    cdef void* pageAddress = <void*>(<size_t>si.si_addr & pageAddressMask)
-    if mprotect(pageAddress, pagesize, PROT_READ|PROT_WRITE):
-        error = errno
-        perror("Could not adjust page protection.")
-        sigaction(SIGSEGV, &originalSigSegAction, NULL)
-        return
-    return
-
-
 
 cdef size_t pagesize = getpagesize()
 cdef size_t pageAddressMask = ~(pagesize-1)
 
 cdef sigaction_t originalSigSegAction
-cdef CProtectedRegion *currentRegion = NULL
-cdef Trx currentTrx = None
+
+cdef AVLTree *regions 
 
 initPageManager()
 
@@ -341,7 +470,7 @@ initPageManager()
 #                                          self.p2Tail.length
 #                                          )
 # 
-#     def _initialize(self):
+#     def initialize(self):
 #         LOG.info("Initializing journal '{self.fileName}'".format(self=self))
 #         assert len(ptypesRedoMagic) < lengthOfMagic
 #         cdef int j
@@ -351,7 +480,7 @@ initPageManager()
 #         self.p2FileHeader.o2Tail = self.p2FileHeader.o2firstTrx = sizeof(
 #             CRedoFileHeader)  # numMetadata*PAGESIZE
 # 
-#     def _mount(self):
+#     def mount(self):
 #         LOG.info(
 #             "Mounting existing journal '{self.fileName}'".format(self=self))
 #         self.p2FileHeader = <CRedoFileHeader*>self.baseAddress

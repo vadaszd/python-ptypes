@@ -4,3 +4,4 @@
 /query.c
 /storage.c
 /pagemanager.c
+/*.o

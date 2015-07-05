@@ -4,18 +4,13 @@
 from cpython.version cimport PY_MAJOR_VERSION
 from libc.string cimport memcpy, memcmp, memset
 from md5 cimport MD5_checksum, MD5_CTX, MD5_Init, MD5_Update, MD5_Final
-from pagemanager cimport pagesize, initPageManager,\
-                         CProtectedRegion_new,\
-                         CProtectedRegion_setCurrent
 
 from math import pow, log as logarithm
-from os import SEEK_SET, O_CREAT, O_RDWR
 from types import ModuleType
 from collections import namedtuple
 from time import strptime, mktime
 import os
 import threading
-import gc
 import textwrap
 import inspect
 from codecs import decode
@@ -90,7 +85,8 @@ cdef class Persistent(object):
 
 # ================ Assignment By Value ================
 
-cdef Offset resolveNoOp(PersistentMeta ptype, Offset offset) except -1:
+cdef Offset resolveNoOp(PersistentMeta ptype, Trx trx, Offset offset
+                        ) except -1:
     return offset
 
 cdef class AssignedByValue(Persistent):
@@ -122,8 +118,9 @@ cdef class AssignedByValue(Persistent):
 
 # ================ Assignment By Reference ================
 
-cdef Offset resolveReference(PersistentMeta ptype, Offset offset) except -1:
-    return (<Offset*>ptype.storage.trx.offset2Address(offset))[0]
+cdef Offset resolveReference(PersistentMeta ptype, Trx trx, Offset offset
+                             ) except -1:
+    return (<Offset*>trx.offset2Address(offset))[0]
 
 cdef class AssignedByReference(Persistent):
     # p2InternalStructure points at a stand-alone object on the heap
@@ -947,9 +944,9 @@ cdef class PList(AssignedByReference):
         o2NewEntry[0] = self.allocate(
             sizeof(CListEntry)  + valueClass.assignmentSize)
         cdef CListEntry *p2NewEntry = (
-                           <CListEntry *>self.trx.offset2Address(o2NewEntry[0]))
-        valueClass.assign((<void*>p2NewEntry) +
-                          (<ListMeta>(self.ptype)).o2Value,
+                       <CListEntry *>self.trx.offset2Address(o2NewEntry[0]))
+        valueClass.assign(self.trx, (<void*>p2NewEntry) +
+                                    (<ListMeta>(self.ptype)).o2Value,
                           value
                           )
         return p2NewEntry
@@ -986,7 +983,7 @@ cdef class PList(AssignedByReference):
         while o2Entry:
             p2Entry = <CListEntry *>(self.trx.offset2Address(o2Entry))
             # LOG.info(p2Entry.o2 Value)
-            yield valueClass.resolveAndCreateProxyFA(p2Entry + 1)
+            yield valueClass.resolveAndCreateProxyFA(self.trx, p2Entry + 1)
             o2Entry = p2Entry.o2NextEntry
 
 cdef class List(TypeDescriptor):
@@ -1349,7 +1346,8 @@ cdef class PField(object):
         assert owner is not None
         owner.ptype.assertSameStorage(self.ptype)
 #         LOG.debug( bytes(('getting', hex(owner.offset), self.offset)) )
-        return self.ptype.resolveAndCreateProxy(owner.offset + self.offset)
+        return self.ptype.resolveAndCreateProxy(owner.trx, 
+                                                owner.offset + self.offset)
 
     def __set__(PField self, PStructure owner, value):
         self.set(owner, value)
@@ -1357,7 +1355,8 @@ cdef class PField(object):
     cdef set(PField self, PStructure owner, value):
         assert owner is not None
 #         LOG.debug( str(('setting', hex(owner.offset), self.offset, value)) )
-        self.ptype.assign(owner.p2InternalStructure + self.offset, value)
+        self.ptype.assign(owner.trx, owner.p2InternalStructure + self.offset, 
+                          value)
 
 # ================ Storage ================
 
@@ -1386,20 +1385,27 @@ cdef class Storage(object):
             Trx oldTrx = self.trx
 
         if trx is None:
-            raise ValueError('need a valid Trx object, not None')
+            self.trx = None
+            self._stringRegistry = None
+            self._root = None
+            return oldTrx
         trx.assertNotClosed()
         self.trx = trx
-        self.p2StorageHeader = self.trx.region.baseAddress
+        self.p2StorageHeader = \
+                <CStorageHeader*>self.trx.payloadRegion.baseAdress
 
         if self.p2StorageHeader.o2ByteStringRegistry:
             LOG.debug("Using the existing stringRegistry")
-            self.stringRegistry = \
+            self._stringRegistry = \
                 ((<PersistentMeta?>self.schema.SetOfByteStrings)
-                    .createProxy(self.p2StorageHeader.o2ByteStringRegistry))
+                    .createProxy(self.trx, 
+                                 self.p2StorageHeader.o2ByteStringRegistry))
         else:
             LOG.debug("Creating a new stringRegistry")
-            self.stringRegistry = self.schema.SetOfByteStrings(self.stringRegistrySize)
-            self.p2StorageHeader.o2ByteStringRegistry = self.stringRegistry.offset
+            self._stringRegistry = \
+                    self.schema.SetOfByteStrings(self.stringRegistrySize)
+            self.p2StorageHeader.o2ByteStringRegistry = \
+                    self._stringRegistry.offset
         LOG.debug('self.p2StorageHeader.o2ByteStringRegistry: {0}'.format(
             hex(self.p2StorageHeader.o2ByteStringRegistry)))
 
@@ -1415,10 +1421,11 @@ cdef class Storage(object):
         LOG.debug('self.p2StorageHeader.o2Root #1: {0}'.format(
             hex(self.p2StorageHeader.o2Root)))
         if self.p2StorageHeader.o2Root:
-            self.__root = Root.createProxy(self.p2StorageHeader.o2Root)
+            self._root = Root.createProxy(self.trx, 
+                                           self.p2StorageHeader.o2Root)
         else:
-            self.__root = Root()
-            self.p2StorageHeader.o2Root = self.__root.offset
+            self._root = Root()
+            self.p2StorageHeader.o2Root = self._root.offset
         LOG.debug('self.p2StorageHeader.o2Root #2: {0}'.format(
             hex(self.p2StorageHeader.o2Root)))
         return oldTrx
@@ -1440,7 +1447,7 @@ cdef class Storage(object):
                                       'SetOfByteStrings', 'ListOfByteStrings'):
                 x = ptype.reduce()
 #                             LOG.debug( 'pickle data:'+ repr(x))
-                s = self.stringRegistry.get(pickle.dumps(x))
+                s = self._stringRegistry.get(pickle.dumps(x))
                 pickledTypeList.append(s)
                 del s  # do not leave a dangling proxy around
         LOG.debug("Saved the new schema.")
@@ -1487,7 +1494,6 @@ cdef class Storage(object):
             else:
                 assert False
             self.typeList.append(ptype)
-            del s  # do not leave a dangling proxy around
 
     cdef Offset allocate(self, int size) except 0:
         self.trx.assertNotClosed()
@@ -1501,18 +1507,25 @@ cdef class Storage(object):
 #               {newFreeOffset}".format(**locals()))
         return origFreeOffset
 
+    property stringRegistry:
+        def __get__(self):
+            assert self.trx
+            self.trx.assertNotClosed()
+            return self._root
+
     property root:
         def __get__(self):
+            assert self.trx
             self.trx.assertNotClosed()
-            return self.__root
+            return self._stringRegistry
 
     def commit(self):
-        self.trx.close(doCommit=True)
         self.setTrx(Trx(self.backingFile))
+        self.trx.close(Persistent, doCommit=True)
 
     def rollback(self):
-        self.trx.close(doCommit=False)
         self.setTrx(Trx(self.backingFile))
+        self.trx.close(Persistent, doCommit=False)
 
     cpdef close(self):
         """ Flush and close the storage.
@@ -1520,7 +1533,7 @@ cdef class Storage(object):
             Triggers a garbage collection to break any unreachable cycles
             referencing the storage.
         """
-        self.trx.close(doCommit=False)
+        self.trx.close(Persistent, doCommit=False)
         BackingFile.close(self)
 
     cdef registerType(self, PersistentMeta ptype):
@@ -1553,7 +1566,7 @@ cdef class Storage(object):
         if typ == 'time':
             return mktime(strptime(value, '%Y-%m-%d %H:%M:%S %Z'))
         elif typ == 'string':
-            return self.stringRegistry.find(value)
+            return self._stringRegistry.find(value)
         elif typ is None:
             return value
         else:

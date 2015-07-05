@@ -20,7 +20,7 @@ moduleNamesAndExtraSources = [
           ("query",         []),
           ("buffer",        []),
           ("pcollections",  []),
-          ("pagemanager",  []),
+          ("pagemanager",  ["ptypes/avl-tree.c"]),
           ]
 
 moduleNameAndSources = []

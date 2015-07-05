@@ -1,9 +1,5 @@
-from libc.stdlib cimport abort
+from .pagemanager cimport Trx, Offset, BackingFile
 
-from .pagemanager cimport Trx
-
-
-ctypedef unsigned long Offset
 
 
 cdef class Persistent(object):
@@ -77,19 +73,19 @@ cdef class PersistentMeta(type):
                                                  Trx trx, 
                                                  Offset offset
                                                  ):
-        return ptype.createProxy(trx, ptype.resolve(ptype, offset))
+        return ptype.createProxy(trx, ptype.resolve(ptype, trx, offset))
 
     cdef inline Persistent resolveAndCreateProxyFA(PersistentMeta   ptype,
                                                    Trx trx, 
                                                    void*            address
                                                    ):
-        return ptype.createProxy(trx, ptype.resolve(ptype,
+        return ptype.createProxy(trx, ptype.resolve(ptype, trx, 
                                        address - trx.region.baseAddress
                                                )
                                  )
 
     cdef void clear(PersistentMeta ptype, Offset o2Target)
-    cdef assign(PersistentMeta ptype, void *target, source, )
+    cdef assign(PersistentMeta ptype, Trx targetTrx, void *target, source, )
     cdef int isAssignedByValue(PersistentMeta ptype) except? -123
     cdef assertType(PersistentMeta ptype, Persistent persistent)
 
@@ -191,20 +187,21 @@ cdef class PHashTable(AssignedByReference):
         return (<void*>p2Entry) + self.o2Value
 
     cdef inline Persistent getKey(self, CHashEntry* p2Entry):
-        return self.keyClass  .resolveAndCreateProxyFA(self.getP2Key(p2Entry))
+        return self.keyClass.resolveAndCreateProxyFA(self.trx, 
+                                                     self.getP2Key(p2Entry))
 
     cdef inline setKey(self, CHashEntry* p2Entry, key):
         if not p2Entry.isUsed:
             self.incrementUsed()
         p2Entry.isUsed = 1
-        self.keyClass.assign(self.getP2Key(p2Entry), key)
+        self.keyClass.assign(self.trx, self.getP2Key(p2Entry), key)
 
     cdef inline Persistent getValue(self, CHashEntry* p2Entry):
         return self.valueClass.\
-            resolveAndCreateProxyFA(self.getP2Value(p2Entry))
+            resolveAndCreateProxyFA(self.trx, self.getP2Value(p2Entry))
 
     cdef inline setValue(self, CHashEntry* p2Entry, value):
-        self.valueClass.assign(self.getP2Value(p2Entry), value)
+        self.valueClass.assign(self.trx, self.getP2Value(p2Entry), value)
 
 
 cdef class PDefaultHashTable(PHashTable):
@@ -288,11 +285,12 @@ cdef class Storage(object):
 
         # Fields depending on the current transaction objects
         CStorageHeader         *p2StorageHeader
-        Persistent              __root
-        readonly PHashTable     stringRegistry
+        Persistent              _root
+        PHashTable              _stringRegistry
 
     cpdef object    internValue(Storage self, str typ, value)
     cpdef Trx       setTrx(self, Trx trx)
+    cpdef           close(self)
 
     cdef inline bint assertOwnClass(Storage self, 
                                        PersistentMeta ptype):

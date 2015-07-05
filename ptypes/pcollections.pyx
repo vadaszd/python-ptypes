@@ -70,10 +70,11 @@ cdef class PSkipNode(AssignedByReference):
 
     cdef inline Persistent getValue(self):
         return (<SkipNodeMeta>self.ptype).valueClass.\
-            resolveAndCreateProxyFA(self.getP2Value())
+            resolveAndCreateProxyFA(self.trx, self.getP2Value())
 
     cdef inline setValue(self, value):
-        (<SkipNodeMeta>self.ptype).valueClass.assign(self.getP2Value(), value)
+        (<SkipNodeMeta>self.ptype).valueClass.assign(self.trx, 
+                                                     self.getP2Value(), value)
 
     cdef inline Persistent getKey(self):
         getKeyFromValue = (<SkipNodeMeta>self.ptype).getKeyFromValue

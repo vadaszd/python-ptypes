@@ -49,9 +49,10 @@ cdef class PNode(AssignedByReference):
 
     cdef inline Persistent getValue(self):
         return (<NodeMeta>self.ptype).valueClass\
-            .resolveAndCreateProxyFA(self.getP2Value())
+            .resolveAndCreateProxyFA(self.trx, self.getP2Value())
     cdef inline setValue(self, value):
-        (<NodeMeta>self.ptype).valueClass.assign(self.getP2Value(), value)
+        (<NodeMeta>self.ptype).valueClass.assign(self.trx, self.getP2Value(), 
+                                                 value)
 
     def __init__(PNode self, object value=None):
         self.getP2IS().o2FirstInEdgeKind = 0
@@ -160,7 +161,7 @@ cdef class EdgeMeta(PersistentMeta):
         PersistentMeta  valueClass
         NodeMeta        fromNodeClass, toNodeClass
 
-        # cache it; avoid calling stringRegistry.get(ptype.__name__)
+        # cache it; avoid calling _stringRegistry.get(ptype.__name__)
         Offset          o2Name
 
         Offset          o2Value
@@ -184,7 +185,7 @@ cdef class EdgeMeta(PersistentMeta):
         ptype.fromNodeClass  =  fromNodeClass
         ptype.toNodeClass  =  toNodeClass
 
-        ptype.o2Name = storage.stringRegistry\
+        ptype.o2Name = storage._stringRegistry\
             .get(ptype.__name__.encode('utf8')).offset
 
     def reduce(ptype):
@@ -204,9 +205,10 @@ cdef class PEdge(AssignedByReference):
 
     cdef inline Persistent getValue(self):
         return (<EdgeMeta>self.ptype).valueClass\
-            .resolveAndCreateProxyFA(self.getP2Value())
+            .resolveAndCreateProxyFA(self.trx, self.getP2Value())
     cdef inline setValue(self, value):
-        (<EdgeMeta>self.ptype).valueClass.assign(self.getP2Value(), value)
+        (<EdgeMeta>self.ptype).valueClass.assign(self.trx, self.getP2Value(), 
+                                                 value)
 
     def __init__(PEdge self, PNode fromPNode not None, PNode toPNode not None,
                  Persistent value=None):
