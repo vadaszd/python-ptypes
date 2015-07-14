@@ -8,7 +8,7 @@ cdef extern from "sys/mman.h" nogil:
     int mprotect(void *addr, size_t len, int prot)
     int msync(void *addr, size_t length, int flags)
     int PROT_READ, PROT_WRITE, PROT_NONE, MS_ASYNC, MS_SYNC
-    int MAP_SHARED, MAP_PRIVATE  # flags
+    int MAP_SHARED, MAP_PRIVATE, MAP_FIXED  # flags
     void *MAP_FAILED
 
 cdef extern from "signal.h" nogil:
@@ -123,14 +123,14 @@ cdef class BackingFile(object):
         else:
             self.adminMapping.protect(&self.adminMapping.adminRegion, PROT_READ)
             self.adminMapping.mount()
-        self.adminMapping.protect(&self.adminMapping.adminRegion, PROT_NONE)
-
         LOG.debug("Highest metadata revision is {0}"
                   .format(self.adminMapping.p2HiHeader.revision))
         LOG.debug("Lowest metadata revision is {0}"
                   .format(self.adminMapping.p2LoHeader.revision))
         LOG.debug("Using metadata revision {0}"
                   .format(self.adminMapping.p2FileHeader.revision))
+
+        self.adminMapping.protect(&self.adminMapping.adminRegion, PROT_NONE)
 
         if not self.isNew and fileSize > self.realFileSize:
             raise Exception("File {self.fileName} is of size "
@@ -188,7 +188,7 @@ cdef class FileMapping(object):
         region.endAddress = region.baseAddress + region.length
 
         LOG.debug( self.__formatErrorMessage(region, 
-                'Mmapped {fileName} memory region {baseAddress}-{length}',
+                'Mmapped {fileName} memory region {baseAddress}-{length}', 0,
                 self.backingFile.fileName))
 
     def __cinit__(self, BackingFile backingFile):
@@ -256,7 +256,8 @@ cdef class AdminMapping(FileMapping):
                 'Could not sync {baseAddress}-{length}: {error}', errno))
 
     cdef initialize(self):
-        LOG.info("Initializing new file '{self.fileName}'".format(self=self))
+        LOG.info("Initializing new file '{}'"
+                 .format(self.backingFile.fileName))
         assert len(ptypesMagic) < lengthOfMagic
 
         cdef int i
@@ -336,7 +337,7 @@ cdef class Trx(FileMapping):
         self.payloadRegion.dirtyPages = avl_tree_new(compareAddresses)
         if NULL == avl_tree_insert(regions, 
                                    <AVLTreeKey>self.payloadRegion.baseAddress, 
-                                   <AVLTreeValue>self.payloadRegion):
+                                   <AVLTreeValue>&self.payloadRegion):
             raise MemoryError()
 
 
@@ -395,8 +396,9 @@ cdef void segv_handler(int sig, siginfo_t *si, void *x ) nogil:
 #             if mprotect(pageAddress, pagesize, PROT_READ|PROT_WRITE):
             pageOffset = pageAddress - payloadRegion.baseAddress + \
                     payloadRegion.o2Base
-            if mmap(pageAddress, pagesize, PROT_READ|PROT_WRITE, MAP_PRIVATE, 
-                                       payloadRegion.fd, pageOffset):
+            if MAP_FAILED == mmap(pageAddress, pagesize, PROT_READ|PROT_WRITE, 
+                                  MAP_PRIVATE|MAP_FIXED, 
+                                  payloadRegion.fd, pageOffset):
                 error = errno
                 perror("Could not remap the page.")
             else:
@@ -411,6 +413,7 @@ cdef void segv_handler(int sig, siginfo_t *si, void *x ) nogil:
 
 
 cdef initPageManager():
+    global regions
     regions = avl_tree_new(compareAddresses)
 
     cdef sigaction_t action

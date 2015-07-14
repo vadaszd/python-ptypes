@@ -1392,7 +1392,10 @@ cdef class Storage(object):
         trx.assertNotClosed()
         self.trx = trx
         self.p2StorageHeader = \
-                <CStorageHeader*>self.trx.payloadRegion.baseAdress
+                <CStorageHeader*>self.trx.payloadRegion.baseAddress
+
+        if self.p2StorageHeader.freeOffset == 0:
+            self.p2StorageHeader.freeOffset = self.trx.payloadRegion.o2Base
 
         if self.p2StorageHeader.o2ByteStringRegistry:
             LOG.debug("Using the existing stringRegistry")
