@@ -139,7 +139,7 @@ cdef class BackingFile(object):
                             )
 
     cpdef close(self):
-        self.assertNotClosed()
+        self.assertNotClosed() method does not exist
         # Need to close the adminMapping first! XXX
         os.close(self.fd)
 
@@ -256,7 +256,7 @@ cdef class AdminMapping(FileMapping):
                 'Could not sync {baseAddress}-{length}: {error}', errno))
 
     cdef initialize(self):
-        LOG.info("Initializing new file '{}'"
+        LOG.info("Initializing new file '{0}'"
                  .format(self.backingFile.fileName))
         assert len(ptypesMagic) < lengthOfMagic
 
@@ -272,7 +272,8 @@ cdef class AdminMapping(FileMapping):
         self.p2HiHeader = self.p2FileHeaders[1]
 
     cdef mount(self):
-        LOG.info("Mounting existing file '{self.fileName}'".format(self=self))
+        LOG.info("Mounting existing file '{0}'"
+                 .format(self.backingFile.fileName))
         self.p2HiHeader = self.p2LoHeader = NULL
 
         cdef int i
@@ -282,9 +283,9 @@ cdef class AdminMapping(FileMapping):
             if any(self.p2FileHeader.magic[j] != ptypesMagic[j]
                    for j in range(len(ptypesMagic))
                    ):
-                raise Exception('File {self.fileName} is incompatible with '
+                raise Exception('File {0} is incompatible with '
                                 'this version of ptypes!'.format(
-                                    self=self)
+                                    self.backingFile.fileName)
                                 )
             if (self.p2LoHeader == NULL or
                     self.p2LoHeader.revision > self.p2FileHeader.revision):
@@ -349,7 +350,7 @@ cdef class Trx(FileMapping):
 
     cdef Trx close(Trx self, type Persistent, bint doCommit):
         LOG.debug("Closing {}".format(self))
-        self.trx.assertNotClosed()
+        self.assertNotClosed()
         suspects = [o for o in gc.get_referrers(self)
                     if isinstance(o, Persistent)
                     ]

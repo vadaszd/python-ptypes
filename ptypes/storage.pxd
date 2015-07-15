@@ -15,6 +15,11 @@ cdef class Persistent(object):
     cdef inline bint isNullAddress(Persistent self, void* address):
         return address == self.trx.region.baseAddress
 
+    cdef inline assertInTrx(Persistent self, Trx trx):
+        if self.trx is not trx :
+            raise ValueError("The source and the target of the assignment "
+                             "are in different transactions!")
+
     cdef inline Offset allocate(self, int size) except 0:
         return self.ptype.storage.allocate(size)
 
@@ -43,7 +48,7 @@ cdef class PersistentMeta(type):
     """
     cdef:
         readonly Storage storage
-        int             allocationSize  # used for allocating memory
+        int              allocationSize  # used for allocating memory
 
         # used in assignments, must equal to allocationSize when the assignment
         # semantics of the type is store-by-value
@@ -84,7 +89,7 @@ cdef class PersistentMeta(type):
                                                )
                                  )
 
-    cdef void clear(PersistentMeta ptype, Offset o2Target)
+    cdef clear(PersistentMeta ptype, Offset o2Target)
     cdef assign(PersistentMeta ptype, Trx targetTrx, void *target, source, )
     cdef int isAssignedByValue(PersistentMeta ptype) except? -123
     cdef assertType(PersistentMeta ptype, Persistent persistent)
@@ -238,7 +243,7 @@ cdef class PList(AssignedByReference):
     cdef inline CList *getP2IS(self):
         return <CList *>self.p2InternalStructure
 
-    cdef CListEntry *newEntry(self, value, Offset* o2NewEntry)
+    cdef CListEntry *newEntry(self, value, Offset* o2NewEntry) except NULL
     cpdef insert(PList self, object value)
     cpdef append(PList self, object value)
 
@@ -292,6 +297,6 @@ cdef class Storage(object):
     cpdef Trx       setTrx(self, Trx trx)
     cpdef           close(self)
 
-    cdef inline bint assertOwnClass(Storage self, 
+    cdef inline assertOwnClass(Storage self, 
                                        PersistentMeta ptype):
         assert ptype.storage is self, (self, ptype.storage)

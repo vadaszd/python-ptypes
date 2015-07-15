@@ -260,7 +260,7 @@ cdef class PersistentMeta(type):
         cdef Persistent self
         if isinstance(source, Persistent):
             ptype.assertType(source)
-            source.assertInTrx(targetTrx)
+            (<Persistent>source).assertInTrx(targetTrx)
             (<Persistent>source).store(target)
         elif ptype.isAssignedByValue():
             ptype.resolveAndCreateProxyFA(targetTrx, target).contents = source
@@ -271,7 +271,7 @@ cdef class PersistentMeta(type):
             self.assertInTrx(targetTrx)
             self.store(target)
 
-    cdef void clear(PersistentMeta ptype, Offset o2Target):
+    cdef clear(PersistentMeta ptype, Offset o2Target):
         memset(ptype.storage.trx.offset2Address(o2Target), 0, ptype.assignmentSize)
 
     cdef int isAssignedByValue(PersistentMeta ptype) except? -123:
@@ -939,7 +939,7 @@ cdef class PList(AssignedByReference):
     def __init__(self):
         self.getP2IS().o2FirstEntry = self.getP2IS().o2LastEntry = 0
 
-    cdef CListEntry *newEntry(self, value, Offset* o2NewEntry):
+    cdef CListEntry *newEntry(self, value, Offset* o2NewEntry) except NULL:
         cdef PersistentMeta valueClass = (<ListMeta>(self.ptype)).valueClass
         o2NewEntry[0] = self.allocate(
             sizeof(CListEntry)  + valueClass.assignmentSize)
@@ -1380,6 +1380,10 @@ cdef class Storage(object):
         self.setTrx(Trx(self.backingFile))
 
     cpdef Trx setTrx(self, Trx trx):
+        """ Set a new transaction.
+        
+            @return: The old transaction.
+        """
         cdef:
             PersistentMeta Root
             Trx oldTrx = self.trx
@@ -1395,7 +1399,8 @@ cdef class Storage(object):
                 <CStorageHeader*>self.trx.payloadRegion.baseAddress
 
         if self.p2StorageHeader.freeOffset == 0:
-            self.p2StorageHeader.freeOffset = self.trx.payloadRegion.o2Base
+            self.p2StorageHeader.freeOffset = (self.trx.payloadRegion.o2Base
+                                               + sizeof(CStorageHeader))
 
         if self.p2StorageHeader.o2ByteStringRegistry:
             LOG.debug("Using the existing stringRegistry")
@@ -1514,21 +1519,19 @@ cdef class Storage(object):
         def __get__(self):
             assert self.trx
             self.trx.assertNotClosed()
-            return self._root
+            return self._stringRegistry
 
     property root:
         def __get__(self):
             assert self.trx
             self.trx.assertNotClosed()
-            return self._stringRegistry
+            return self._root
 
     def commit(self):
-        self.setTrx(Trx(self.backingFile))
-        self.trx.close(Persistent, doCommit=True)
+        self.setTrx(Trx(self.backingFile)).close(Persistent, doCommit=True)
 
     def rollback(self):
-        self.setTrx(Trx(self.backingFile))
-        self.trx.close(Persistent, doCommit=False)
+        self.setTrx(Trx(self.backingFile)).close(Persistent, doCommit=False)
 
     cpdef close(self):
         """ Flush and close the storage.
@@ -1536,8 +1539,8 @@ cdef class Storage(object):
             Triggers a garbage collection to break any unreachable cycles
             referencing the storage.
         """
-        self.trx.close(Persistent, doCommit=False)
-        BackingFile.close(self)
+        self.setTrx(None).close(Persistent, doCommit=False)
+        self.backingFile.close()
 
     cdef registerType(self, PersistentMeta ptype):
         if hasattr(self.schema, ptype.__name__):
