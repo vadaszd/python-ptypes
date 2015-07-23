@@ -70,7 +70,7 @@ the *schema* of the storage::
       >>> p.schema                                          #doctest: +ELLIPSIS
       <module 'schema'...>
       >>> [x for x in dir(p.schema) if not x.startswith('__')]
-      ['ByteString', 'Float', 'Int', 'Root', 'Structure']
+      ['ByteString', 'Float', 'Int', 'ListOfByteStrings', 'Root', 'SetOfByteStrings', 'Structure']
 
 It is essential that before we lose the reference to a storage object we
 :meth:`~ptypes.storage.Storage.close()` it, otherwise the underlying file
@@ -216,8 +216,8 @@ size parameters or a schema. Its contents is preserved::
       >>> p = Storage(mmapFileName)
       >>> p.root #doctest: +ELLIPSIS
       <persistent Root object @offset 0x...>
-      >>> print(p.root.name.contents.decode())
-      James Bond
+      >>> str(p.root.name)
+      'James Bond'
       >>> p.close()
       >>> os.unlink(mmapFileName)
 
@@ -322,7 +322,7 @@ and List work with types assigned by value::
       >>> p.close()                                                             #doctest: +ELLIPSIS
       Traceback (most recent call last):
       ...
-      ValueError: Cannot close <MyStorage '...'> - some proxies are still around: <persistent Agent object @offset 0x...>
+      ValueError: Cannot close <ptypes.pagemanager.Trx ...> - some proxies are still around: <persistent Agent object @offset 0x...>
 
 Ooops... Indeed, the ``key``, ``value`` and ``agent`` references from the
 previous examples are still around, and if we closed the storage (which unmaps
