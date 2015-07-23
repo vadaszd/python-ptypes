@@ -123,10 +123,10 @@ cdef class BackingFile(object):
         else:
             self.adminMapping.protect(&self.adminMapping.adminRegion, PROT_READ)
             self.adminMapping.mount()
-        LOG.debug("Highest metadata revision is {0}"
-                  .format(self.adminMapping.p2HiHeader.revision))
-        LOG.debug("Lowest metadata revision is {0}"
-                  .format(self.adminMapping.p2LoHeader.revision))
+#         LOG.debug("Highest metadata revision is {0}"
+#                   .format(self.adminMapping.p2HiHeader.revision))
+#         LOG.debug("Lowest metadata revision is {0}"
+#                   .format(self.adminMapping.p2LoHeader.revision))
         LOG.debug("Using metadata revision {0}"
                   .format(self.adminMapping.p2FileHeader.revision))
 
@@ -139,9 +139,13 @@ cdef class BackingFile(object):
                             )
 
     cpdef close(self):
-        self.assertNotClosed() method does not exist
-        # Need to close the adminMapping first! XXX
-        os.close(self.fd)
+        cdef list 
+        if self.adminMapping is not None:
+            referers = [o for o in gc.get_referrers(self.adminMapping)]
+            assert len(referers) == 1, referers 
+            self.adminMapping = None
+            os.close(self.fd)
+            self.fd = -1
 
     def __repr__(self):
         return ("<{self.__class__.__name__} '{self.fileName}'>"
@@ -268,56 +272,55 @@ cdef class AdminMapping(FileMapping):
             self.p2FileHeader.status = 'C'
             self.p2FileHeader.revision = i
 
-        self.p2LoHeader = self.p2FileHeaders[0]
-        self.p2HiHeader = self.p2FileHeaders[1]
+#         self.p2LoHeader = self.p2FileHeaders[0]
+#         self.p2HiHeader = self.p2FileHeaders[1]
 
     cdef mount(self):
         LOG.info("Mounting existing file '{0}'"
                  .format(self.backingFile.fileName))
-        self.p2HiHeader = self.p2LoHeader = NULL
 
-        cdef int i
+        cdef:
+            CBackingFileHeader       *p2Header
+            int i
+        self.p2FileHeader = NULL
         for i in range(numMetadata):
-            self.p2FileHeader = self.p2FileHeaders[i] = \
+            p2FileHeader = self.p2FileHeaders[i] = \
                 <CBackingFileHeader*>(self.region.baseAddress + i*pagesize)
-            if any(self.p2FileHeader.magic[j] != ptypesMagic[j]
+            if any(p2FileHeader.magic[j] != ptypesMagic[j]
                    for j in range(len(ptypesMagic))
                    ):
                 raise Exception('File {0} is incompatible with '
                                 'this version of ptypes!'.format(
                                     self.backingFile.fileName)
                                 )
-            if (self.p2LoHeader == NULL or
-                    self.p2LoHeader.revision > self.p2FileHeader.revision):
-                self.p2LoHeader = self.p2FileHeader
-            if (self.p2HiHeader == NULL or
-                    self.p2HiHeader.revision < self.p2FileHeader.revision):
-                self.p2HiHeader = self.p2FileHeader
+            if p2FileHeader.status == 'C' :
+                if self.p2FileHeader == NULL:
+                    self.p2FileHeader = p2FileHeader
+                else:
+                    assert self.p2FileHeader.revision != p2FileHeader.revision
+                    if self.p2FileHeader.revision < p2FileHeader.revision:
+                        self.p2FileHeader = p2FileHeader
 
-        if self.p2HiHeader.status == 'C':  # roll back
-            LOG.debug("Latest shutdown was clean, using latest metadata.")
-            self.p2FileHeader = self.p2LoHeader
-            self.p2FileHeader[0] = self.p2HiHeader[0]
-        else:
-            LOG.info(
-                "Latest shutdown was incomplete, restoring previous metadata.")
-            self.p2FileHeader = self.p2HiHeader
-            self.p2FileHeader[0] = self.p2LoHeader[0]
-            if self.p2HiHeader.status != 'C':
-                raise Exception("No clean metadata could be found!")
+        if self.p2FileHeader == NULL:
+            raise Exception("No clean metadata could be found!")
+        assert ( (self.p2FileHeader.revision % numMetadata) *pagesize ==
+                 (<void*>self.p2FileHeader) - self.region.baseAddress ), \
+                [self.p2FileHeader.revision, 
+                 (<void*>self.p2FileHeader) - self.region.baseAddress ]
 
     cdef sync(self, Trx trx, bint doFlush=False):
         cdef:
-            CBackingFileHeader *p2OriginalFileHeader = self.p2FileHeader
+            unsigned long newRevision
+            CBackingFileHeader *p2NewFileHeader
         if doFlush:
             self.protect(&self.adminRegion, PROT_READ|PROT_WRITE)
-            self.p2FileHeader = self.p2FileHeaders[ 
-                               p2OriginalFileHeader.revision % numMetadata]
-            self.p2FileHeader[0] = p2OriginalFileHeader[0]  # copy the header
-            self.p2FileHeader.status = 'D'
-            self.p2FileHeader.revision += 1
-            # self.p2FileHeader.lastAppliedRedoFileNumber
-            # self.p2FileHeader.o2lastAppliedTrx
+            newRevision = self.p2FileHeader.revision + 1
+            p2NewFileHeader = self.p2FileHeaders[newRevision % numMetadata]
+            p2NewFileHeader[0] = self.p2FileHeader[0]    # copy the header
+            p2NewFileHeader.status = 'D'
+            p2NewFileHeader.revision = newRevision
+            # p2NewFileHeader.lastAppliedRedoFileNumber
+            # p2NewFileHeader.o2lastAppliedTrx
             self.protect(&self.adminRegion, PROT_NONE)
 
         self.protect(&self.payloadRegion, PROT_READ|PROT_WRITE)
@@ -327,9 +330,10 @@ cdef class AdminMapping(FileMapping):
         if doFlush:
             self.flush(&self.payloadRegion)
             self.protect(&self.adminRegion, PROT_READ|PROT_WRITE)
-            self.p2FileHeader.status = 'C'
+            p2NewFileHeader.status = 'C'
             self.protect(&self.adminRegion, PROT_NONE)
             self.flush(&self.adminRegion)
+            self.p2FileHeader = p2NewFileHeader
 
 cdef class Trx(FileMapping):
     """ An atomically updateable memory region mapped into a file
@@ -358,6 +362,7 @@ cdef class Trx(FileMapping):
             LOG.warning('The following proxy objects are probably part of a '
                         'reference cycle: \n{}' .format(suspects)
                         )
+        del suspects
         gc.collect()
         suspects = [o for o in gc.get_referrers(self)
                     if isinstance(o, Persistent)
@@ -365,7 +370,9 @@ cdef class Trx(FileMapping):
         if suspects:
             raise ValueError("Cannot close {} - some proxies are still around:"
                              " {}".format(
-                                 self, ' '.join([repr(s) for s in suspects]))
+                                 self, ' '.join([repr(s) for s in suspects]),
+                                 #' '.join([repr(gc.get_referrers(s)) for s in suspects]),
+                                 )
                              )
         self.backingFile.adminMapping.sync(self, doFlush=True)
 

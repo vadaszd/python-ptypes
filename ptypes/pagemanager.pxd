@@ -59,8 +59,6 @@ cdef class FileMapping(object):
 cdef class AdminMapping(FileMapping):
     cdef:
         CBackingFileHeader       *p2FileHeaders[numMetadata]
-        CBackingFileHeader       *p2HiHeader
-        CBackingFileHeader       *p2LoHeader
         CBackingFileHeader       *p2FileHeader
 
         protect(self, CRegion *region, int protectionMode)
