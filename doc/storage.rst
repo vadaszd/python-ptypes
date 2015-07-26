@@ -342,12 +342,12 @@ again will raise a ValueError exception::
       >>> p.root                                               #doctest: +ELLIPSIS
       Traceback (most recent call last):
        ...
-      ValueError: Storage ... is closed.
+      ValueError: Storage ... is already closed.
 
       >>> p.close()                                                #doctest: +ELLIPSIS
       Traceback (most recent call last):
        ...
-      ValueError: Storage ... is closed.
+      ValueError: BackingFile ... is closed.
       >>> os.unlink(mmapFileName)
 
 Now we really can continue and demonstrate that the

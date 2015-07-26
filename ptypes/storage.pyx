@@ -19,6 +19,7 @@ from warnings import warn
 from .compat import pickle
 
 import logging
+from Cython.Shadow import NULL
 LOG = logging.getLogger(__name__)
 
 cdef class PList
@@ -1376,67 +1377,114 @@ cdef class Storage(object):
         self.define(__ByteString('ByteString'))
         self.define(List('ListOfByteStrings')[self.schema.ByteString])
         self.define(Set('SetOfByteStrings')[self.schema.ByteString])
-        self.trx = None
-        self.setTrx(Trx(self.backingFile))
+        self.attachTrx(Trx(self.backingFile))
+
+    def commit(self):
+        self.completeTrx(doCommit=True)
+
+    def rollback(self):
+        self.completeTrx(doCommit=False)
 
     cpdef Trx setTrx(self, Trx trx):
         """ Set a new transaction.
-        
+
             @return: The old transaction.
         """
+        self.assertNotClosed()
+        trx.assertNotClosed()
+
         cdef:
-            PersistentMeta Root
+            Trx oldTrx = self.detachTrx()
+        self.attachTrx(trx)
+        return oldTrx
+
+    cpdef close(self, bint doCommit=True):
+        """ Flush and close the storage.
+
+            Triggers a garbage collection to break any unreachable cycles
+            referencing the storage.
+        """
+        self.closeTrx(doCommit=doCommit)
+        self.backingFile.close()
+
+    cdef completeTrx(self, bint doCommit=True):
+        self.closeTrx(doCommit=doCommit)
+        self.attachTrx(Trx(self.backingFile))
+
+    cdef closeTrx(self, bint doCommit):
+        self.assertNotClosed()
+
+        cdef:
+            Trx oldTrx = self.detachTrx()
+        try:
+            oldTrx.close(Persistent, doCommit=doCommit)
+        except:
+            self.attachTrx(oldTrx)
+            raise 
+
+    cdef Trx detachTrx(self):
+        cdef:
             Trx oldTrx = self.trx
 
-        if trx is None:
-            self.trx = None
-            self._stringRegistry = None
-            self._root = None
-            return oldTrx
-        trx.assertNotClosed()
-        self.trx = trx
-        self.p2StorageHeader = \
-                <CStorageHeader*>self.trx.payloadRegion.baseAddress
-
-        if self.p2StorageHeader.freeOffset == 0:
-            self.p2StorageHeader.freeOffset = (self.trx.payloadRegion.o2Base
-                                               + sizeof(CStorageHeader))
-
-        if self.p2StorageHeader.o2ByteStringRegistry:
-            LOG.debug("Using the existing stringRegistry")
-            self._stringRegistry = \
-                ((<PersistentMeta?>self.schema.SetOfByteStrings)
-                    .createProxy(self.trx, 
-                                 self.p2StorageHeader.o2ByteStringRegistry))
-        else:
-            LOG.debug("Creating a new stringRegistry")
-            self._stringRegistry = \
-                    self.schema.SetOfByteStrings(self.stringRegistrySize)
-            self.p2StorageHeader.o2ByteStringRegistry = \
-                    self._stringRegistry.offset
-        LOG.debug('self.p2StorageHeader.o2ByteStringRegistry: {0}'.format(
-            hex(self.p2StorageHeader.o2ByteStringRegistry)))
-
-        if self.p2StorageHeader.o2PickledTypeList:
-            self.loadSchema()
-        else:
-            self.createSchema()
-        try:
-            Root = self.schema.Root
-        except AttributeError:
-            raise Exception(
-                "The schema contains no type called 'Root'.")
-        LOG.debug('self.p2StorageHeader.o2Root #1: {0}'.format(
-            hex(self.p2StorageHeader.o2Root)))
-        if self.p2StorageHeader.o2Root:
-            self._root = Root.createProxy(self.trx, 
-                                           self.p2StorageHeader.o2Root)
-        else:
-            self._root = Root()
-            self.p2StorageHeader.o2Root = self._root.offset
-        LOG.debug('self.p2StorageHeader.o2Root #2: {0}'.format(
-            hex(self.p2StorageHeader.o2Root)))
+        self.trx = None
+        self._stringRegistry = None
+        self._root = None
+        self.p2StorageHeader = NULL
         return oldTrx
+
+    cdef attachTrx(self, Trx trx):
+        cdef:
+            PersistentMeta Root
+
+        self.trx = trx
+        try:
+            self.p2StorageHeader = \
+                    <CStorageHeader*>self.trx.payloadRegion.baseAddress
+
+            if self.p2StorageHeader.freeOffset == 0:
+                self.p2StorageHeader.freeOffset = (self.trx.payloadRegion
+                                    .o2Base + sizeof(CStorageHeader))
+
+            if self.p2StorageHeader.o2ByteStringRegistry:
+                LOG.debug("Using the existing stringRegistry")
+                self._stringRegistry = \
+                    ((<PersistentMeta?>self.schema.SetOfByteStrings)
+                        .createProxy(self.trx, 
+                                 self.p2StorageHeader.o2ByteStringRegistry))
+            else:
+                LOG.debug("Creating a new stringRegistry")
+                self._stringRegistry = \
+                        self.schema.SetOfByteStrings(self.stringRegistrySize)
+                self.p2StorageHeader.o2ByteStringRegistry = \
+                        self._stringRegistry.offset
+            LOG.debug('self.p2StorageHeader.o2ByteStringRegistry: {0}'.format(
+                hex(self.p2StorageHeader.o2ByteStringRegistry)))
+
+            try:
+                Root = self.schema.Root
+            except AttributeError:
+                if self.p2StorageHeader.o2PickledTypeList:
+                    self.loadSchema()
+                else:
+                    self.createSchema()
+                try:
+                    Root = self.schema.Root
+                except AttributeError:
+                    raise Exception(
+                        "The schema contains no type called 'Root'.")
+            LOG.debug('self.p2StorageHeader.o2Root #1: {0}'.format(
+                hex(self.p2StorageHeader.o2Root)))
+            if self.p2StorageHeader.o2Root:
+                self._root = Root.createProxy(self.trx, 
+                                               self.p2StorageHeader.o2Root)
+            else:
+                self._root = Root()
+                self.p2StorageHeader.o2Root = self._root.offset
+            LOG.debug('self.p2StorageHeader.o2Root #2: {0}'.format(
+                hex(self.p2StorageHeader.o2Root)))
+        except:
+            self.detachTrx()
+            raise 
 
     def createSchema(self):
         LOG.debug("Creating a new schema")
@@ -1504,7 +1552,7 @@ cdef class Storage(object):
             self.typeList.append(ptype)
 
     cdef Offset allocate(self, int size) except 0:
-        self.trx.assertNotClosed()
+        self.assertNotClosed()
         cdef:
             Offset origFreeOffset = self.p2StorageHeader.freeOffset
             Offset newFreeOffset = self.p2StorageHeader.freeOffset + size
@@ -1517,30 +1565,13 @@ cdef class Storage(object):
 
     property stringRegistry:
         def __get__(self):
-            assert self.trx
-            self.trx.assertNotClosed()
+            self.assertNotClosed()
             return self._stringRegistry
 
     property root:
         def __get__(self):
-            assert self.trx
-            self.trx.assertNotClosed()
+            self.assertNotClosed()
             return self._root
-
-    def commit(self):
-        self.setTrx(Trx(self.backingFile)).close(Persistent, doCommit=True)
-
-    def rollback(self):
-        self.setTrx(Trx(self.backingFile)).close(Persistent, doCommit=False)
-
-    cpdef close(self):
-        """ Flush and close the storage.
-
-            Triggers a garbage collection to break any unreachable cycles
-            referencing the storage.
-        """
-        self.setTrx(None).close(Persistent, doCommit=False)
-        self.backingFile.close()
 
     cdef registerType(self, PersistentMeta ptype):
         if hasattr(self.schema, ptype.__name__):

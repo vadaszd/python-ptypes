@@ -352,7 +352,8 @@ cdef class Trx(FileMapping):
         self.payloadRegion.dirtyPages = NULL
 
 
-    cdef Trx close(Trx self, type Persistent, bint doCommit):
+    cdef close(Trx self, type Persistent, bint doCommit):
+        self.backingFile.assertNotClosed()
         LOG.debug("Closing {}".format(self))
         self.assertNotClosed()
         suspects = [o for o in gc.get_referrers(self)

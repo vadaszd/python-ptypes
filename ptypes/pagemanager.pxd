@@ -33,6 +33,11 @@ cdef class BackingFile(object):
 #     cpdef flush(self, bint async=?)
     cpdef close(self)
 
+    cdef inline assertNotClosed(self):
+        if self.adminMapping is None:
+            raise ValueError(
+                'BackingFile {} is closed.'
+                .format(self.fileName))
 
 cdef struct CRegion:
     void   *baseAddress   # address of 1st byte included
@@ -72,14 +77,14 @@ cdef class Trx(FileMapping):
     """ An atomically updateable memory region mapped into a file
     """
     cdef:
-        Trx close(Trx self, type Persistent, bint doCommit)
+        close(Trx self, type Persistent, bint doCommit)
         updatePayload(self, void *targetRegionBaseAddress)
 
 
     cdef inline assertNotClosed(self):
         if self.region.baseAddress == NULL:
             raise ValueError(
-                'BackingFile {} is closed.'
+                'This transaction on {} is closed.'
                 .format(self.backingFile.fileName))
 
     cdef inline void*  offset2Address(self, Offset offset) except NULL:

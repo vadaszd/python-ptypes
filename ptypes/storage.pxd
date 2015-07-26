@@ -293,9 +293,21 @@ cdef class Storage(object):
         Persistent              _root
         PHashTable              _stringRegistry
 
+        completeTrx(self, bint doCommit=?)
+        closeTrx(self, bint doCommit)
+        Trx detachTrx(self)
+        attachTrx(self, Trx trx)
+
+    cdef inline assertNotClosed(self):
+        self.backingFile.assertNotClosed()
+        if self.trx is None:
+            raise ValueError("{} is already closed.".format(self))
+        self.trx.assertNotClosed()
+
+
     cpdef object    internValue(Storage self, str typ, value)
     cpdef Trx       setTrx(self, Trx trx)
-    cpdef           close(self)
+    cpdef           close(self, bint doCommit=?)
 
     cdef inline assertOwnClass(Storage self, 
                                        PersistentMeta ptype):
