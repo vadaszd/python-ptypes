@@ -342,7 +342,7 @@ again will raise a ValueError exception::
       >>> p.root                                               #doctest: +ELLIPSIS
       Traceback (most recent call last):
        ...
-      ValueError: Storage ... is already closed.
+      ValueError: BackingFile ... is closed.
 
       >>> p.close()                                                #doctest: +ELLIPSIS
       Traceback (most recent call last):

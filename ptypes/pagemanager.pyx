@@ -347,7 +347,7 @@ cdef class Trx(FileMapping):
 
 
     def __dealloc__(self):
-        avl_tree_remove(regions, <AVLTreeKey>self.region.baseAddress)
+        avl_tree_remove(regions, <AVLTreeKey>self.payloadRegion.baseAddress)
         avl_tree_free(self.payloadRegion.dirtyPages)
         self.payloadRegion.dirtyPages = NULL
 
@@ -400,7 +400,7 @@ cdef void segv_handler(int sig, siginfo_t *si, void *x ) nogil:
     if (sig == SIGSEGV and si.si_signo == SIGSEGV and 
             si.si_code == SEGV_ACCERR ):
         payloadRegion = findRegion(si.si_addr)
-        if payloadRegion != NULL:
+        if payloadRegion != NULL and payloadRegion.baseAddress != NULL:
             pageAddress = <void*>(<size_t>si.si_addr & pageAddressMask)
 #             if mprotect(pageAddress, pagesize, PROT_READ|PROT_WRITE):
             pageOffset = pageAddress - payloadRegion.baseAddress + \
